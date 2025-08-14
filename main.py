@@ -102,16 +102,13 @@ def start_dashboard():
         else:
             port = 5000
             
-        # Use eventlet for better WebSocket support
-        import eventlet
-        eventlet.monkey_patch()
-        
         socketio.run(
             dashboard_app,
             host="0.0.0.0",
             port=port,
             debug=False,
-            use_reloader=False
+            use_reloader=False,
+            allow_unsafe_werkzeug=True
         )
     except Exception as e:
         logger.error(f"Failed to start dashboard: {e}")

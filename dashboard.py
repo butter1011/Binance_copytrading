@@ -4,13 +4,6 @@ import sys
 # Set environment variable to avoid OpenSSL issues
 os.environ['OPENSSL_CONF'] = ''
 
-try:
-    import eventlet
-    eventlet.monkey_patch()
-except Exception as e:
-    print(f"Warning: Eventlet monkey patching failed: {e}")
-    print("Continuing without eventlet optimization...")
-
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from flask_socketio import SocketIO, emit
 import requests
@@ -22,7 +15,8 @@ import logging
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'butter1011'
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Use threading async mode to avoid conflicts with asyncio/uvicorn in the same process
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # API configuration
 API_BASE_URL = "http://127.0.0.1:8000"  # Use IP instead of localhost to avoid DNS issues
@@ -319,4 +313,4 @@ if __name__ == '__main__':
     update_thread.start()
     
     # Run the Flask app
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
