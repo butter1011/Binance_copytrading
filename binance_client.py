@@ -18,9 +18,23 @@ class BinanceClient:
         
         # Initialize Binance client
         if testnet:
+            # Enable testnet mode and force USD-M Futures endpoints
             self.client = Client(api_key, secret_key, testnet=True)
+            try:
+                # Ensure python-binance uses Futures TESTNET REST base
+                # USD-M Futures (fapi)
+                self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+                # Optional: Futures data endpoint
+                if hasattr(self.client, "FUTURES_DATA_URL"):
+                    self.client.FUTURES_DATA_URL = "https://testnet.binancefuture.com/futures/data"
+                # Optional: COIN-M Futures (not used here, but set to testnet just in case)
+                if hasattr(self.client, "FUTURES_COIN_URL"):
+                    self.client.FUTURES_COIN_URL = "https://testnet.binancefuture.com/dapi"
+            except Exception:
+                pass
             self.base_url = "https://testnet.binancefuture.com"
         else:
+            # Mainnet defaults are already USD-M Futures (fapi) aware in python-binance
             self.client = Client(api_key, secret_key)
             self.base_url = "https://fapi.binance.com"
         

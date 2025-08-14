@@ -22,14 +22,10 @@ class Config:
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 30
     
-    # Binance API
-    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-    BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
-    BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
-    
     # Development/Test mode
     TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
     SKIP_CREDENTIAL_VALIDATION = os.getenv("SKIP_CREDENTIAL_VALIDATION", "false").lower() == "true"
+    BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
     
     # Copy Trading Settings
     DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
