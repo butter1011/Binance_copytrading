@@ -25,6 +25,7 @@ class Config:
     # Development/Test mode
     TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
     SKIP_CREDENTIAL_VALIDATION = os.getenv("SKIP_CREDENTIAL_VALIDATION", "false").lower() == "true"
+    ALLOW_SUBACCOUNT_BYPASS = os.getenv("ALLOW_SUBACCOUNT_BYPASS", "false").lower() == "true"
     BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
     
     # Copy Trading Settings

@@ -99,6 +99,7 @@ async def create_account(account: AccountCreate, db = Depends(get_db)):
         # Check if we should skip credential validation (for testing)
         if not Config.SKIP_CREDENTIAL_VALIDATION:
             # Test connection to Binance
+            logger.info(f"Validating API credentials for account: {account.name} (is_master: {account.is_master})")
             client = BinanceClient(
                 api_key=account.api_key,
                 secret_key=account.secret_key,
@@ -106,7 +107,16 @@ async def create_account(account: AccountCreate, db = Depends(get_db)):
             )
             
             if not await client.test_connection():
-                raise HTTPException(status_code=400, detail="Invalid API credentials. Please check your Binance API key and secret.")
+                error_msg = f"API credential validation failed for account '{account.name}'. "
+                if account.is_master:
+                    error_msg += "Master accounts require futures trading permissions. "
+                else:
+                    error_msg += "Subaccounts may have limited permissions. "
+                error_msg += "Please check your Binance API key, secret, and permissions."
+                logger.error(error_msg)
+                raise HTTPException(status_code=400, detail=error_msg)
+            else:
+                logger.info(f"✓ API credentials validated successfully for account: {account.name}")
         else:
             logger.info("Skipping credential validation (test mode)")
         

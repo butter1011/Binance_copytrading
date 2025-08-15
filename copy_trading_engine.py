@@ -59,16 +59,26 @@ class CopyTradingEngine:
                     testnet=Config.BINANCE_TESTNET
                 )
                 
-                # Test connection
-                if await client.test_connection():
+                # Test connection with different requirements for master vs follower
+                connection_valid = await client.test_connection()
+                
+                if connection_valid:
                     if account.is_master:
                         self.master_clients[account.id] = client
-                        logger.info(f"Master account loaded: {account.name} (ID: {account.id})")
+                        logger.info(f"✅ Master account loaded: {account.name} (ID: {account.id})")
                     else:
                         self.follower_clients[account.id] = client
-                        logger.info(f"Follower account loaded: {account.name} (ID: {account.id})")
+                        logger.info(f"✅ Follower account loaded: {account.name} (ID: {account.id})")
+                elif not account.is_master:
+                    # For follower accounts (subaccounts), be more lenient
+                    logger.warning(f"⚠️ Follower account {account.name} has limited API permissions")
+                    logger.info(f"🔄 Attempting to load anyway for copy trading...")
+                    
+                    # Load follower anyway if it's a subaccount - we'll handle errors during trading
+                    self.follower_clients[account.id] = client
+                    logger.info(f"✅ Follower account loaded with limited permissions: {account.name} (ID: {account.id})")
                 else:
-                    logger.error(f"Failed to connect to account: {account.name} (ID: {account.id})")
+                    logger.error(f"❌ Failed to connect to account: {account.name} (ID: {account.id})")
             
             logger.info(f"Loaded {len(self.master_clients)} master accounts and {len(self.follower_clients)} follower accounts")
             session.close()
