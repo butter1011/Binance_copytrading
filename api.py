@@ -78,7 +78,7 @@ def get_db():
 # Authentication middleware (simple implementation)
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     # In production, implement proper JWT token verification
-    if credentials.credentials != "your-secret-token":
+    if credentials.credentials != "butter1011":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",

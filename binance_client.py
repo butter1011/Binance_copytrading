@@ -44,7 +44,10 @@ class BinanceClient:
     async def test_connection(self) -> bool:
         """Test API connection"""
         try:
-            account = self.client.futures_account()
+            import asyncio
+            loop = asyncio.get_event_loop()
+            # Run the sync call in a thread pool to avoid blocking
+            account = await loop.run_in_executor(None, self.client.futures_account)
             return True
         except Exception as e:
             logger.error(f"Connection test failed: {e}")
@@ -53,7 +56,9 @@ class BinanceClient:
     async def get_account_info(self) -> Dict:
         """Get account information"""
         try:
-            account = self.client.futures_account()
+            import asyncio
+            loop = asyncio.get_event_loop()
+            account = await loop.run_in_executor(None, self.client.futures_account)
             return {
                 'total_wallet_balance': float(account['totalWalletBalance']),
                 'total_unrealized_profit': float(account['totalUnrealizedProfit']),
@@ -68,7 +73,9 @@ class BinanceClient:
     async def get_positions(self) -> List[Dict]:
         """Get current positions"""
         try:
-            positions = self.client.futures_position_information()
+            import asyncio
+            loop = asyncio.get_event_loop()
+            positions = await loop.run_in_executor(None, self.client.futures_position_information)
             return [
                 {
                     'symbol': pos['symbol'],
@@ -88,7 +95,9 @@ class BinanceClient:
     async def get_balance(self) -> float:
         """Get available balance"""
         try:
-            account = self.client.futures_account()
+            import asyncio
+            loop = asyncio.get_event_loop()
+            account = await loop.run_in_executor(None, self.client.futures_account)
             return float(account['availableBalance'])
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
