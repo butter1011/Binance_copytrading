@@ -317,6 +317,24 @@ async def update_copy_trading_config(config_id: int, config_update: CopyTradingC
         logger.error(f"Error updating copy trading config: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/copy-trading-config/{config_id}")
+async def delete_copy_trading_config(config_id: int, db = Depends(get_db)):
+    """Delete copy trading configuration"""
+    try:
+        config = db.query(CopyTradingConfig).filter(CopyTradingConfig.id == config_id).first()
+        if not config:
+            raise HTTPException(status_code=404, detail="Configuration not found")
+        
+        # Delete from database
+        db.delete(config)
+        db.commit()
+        
+        return {"message": "Configuration deleted successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error deleting copy trading config: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Trade management
 @app.post("/trades", response_model=Dict)
 async def create_trade(trade: TradeCreate, db = Depends(get_db)):

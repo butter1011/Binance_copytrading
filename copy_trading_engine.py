@@ -48,7 +48,11 @@ class CopyTradingEngine:
             session = get_session()
             accounts = session.query(Account).filter(Account.is_active == True).all()
             
+            logger.info(f"Loading {len(accounts)} active accounts...")
+            
             for account in accounts:
+                logger.info(f"Processing account {account.id}: {account.name} (is_master: {account.is_master})")
+                
                 client = BinanceClient(
                     api_key=account.api_key,
                     secret_key=account.secret_key,
@@ -59,13 +63,14 @@ class CopyTradingEngine:
                 if await client.test_connection():
                     if account.is_master:
                         self.master_clients[account.id] = client
-                        logger.info(f"Master account loaded: {account.name}")
+                        logger.info(f"Master account loaded: {account.name} (ID: {account.id})")
                     else:
                         self.follower_clients[account.id] = client
-                        logger.info(f"Follower account loaded: {account.name}")
+                        logger.info(f"Follower account loaded: {account.name} (ID: {account.id})")
                 else:
-                    logger.error(f"Failed to connect to account: {account.name}")
-                    
+                    logger.error(f"Failed to connect to account: {account.name} (ID: {account.id})")
+            
+            logger.info(f"Loaded {len(self.master_clients)} master accounts and {len(self.follower_clients)} follower accounts")
             session.close()
         except Exception as e:
             logger.error(f"Failed to load accounts: {e}")
@@ -77,10 +82,21 @@ class CopyTradingEngine:
             session = get_session()
             configs = session.query(CopyTradingConfig).filter(CopyTradingConfig.is_active == True).all()
             
+            logger.info(f"Loading {len(configs)} active copy trading configurations...")
+            logger.info(f"Available master accounts: {list(self.master_clients.keys())}")
+            logger.info(f"Available follower accounts: {list(self.follower_clients.keys())}")
+            
             for config in configs:
-                if config.master_account_id in self.master_clients and config.follower_account_id in self.follower_clients:
+                master_available = config.master_account_id in self.master_clients
+                follower_available = config.follower_account_id in self.follower_clients
+                
+                if master_available and follower_available:
                     logger.info(f"Copy trading config loaded: Master {config.master_account_id} -> Follower {config.follower_account_id}")
                 else:
+                    if not master_available:
+                        logger.warning(f"Master account {config.master_account_id} not available (not loaded or not master)")
+                    if not follower_available:
+                        logger.warning(f"Follower account {config.follower_account_id} not available (not loaded or is master)")
                     logger.warning(f"Invalid copy trading config: Master {config.master_account_id} -> Follower {config.follower_account_id}")
                     
             session.close()

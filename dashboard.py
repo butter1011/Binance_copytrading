@@ -27,6 +27,7 @@ system_status = {}
 accounts_data = []
 trades_data = []
 logs_data = []
+copy_configs_data = []
 
 def fetch_api_data(endpoint, params=None):
     """Fetch data from the API"""
@@ -74,6 +75,33 @@ def post_api_data(endpoint, data):
         logging.error(f"Unexpected error for {endpoint}: {e}")
         return None
 
+def delete_api_data(endpoint):
+    """Delete data from the API"""
+    try:
+        headers = {"Authorization": f"Bearer {API_TOKEN}"}
+        url = f"{API_BASE_URL}{endpoint}"
+        logging.info(f"Sending DELETE request to: {url}")
+        response = requests.delete(url, headers=headers, timeout=15)
+        logging.info(f"DELETE response status: {response.status_code}")
+        if response.status_code in [200, 204]:
+            return response.json() if response.content else {"message": "Success"}
+        else:
+            logging.error(f"API DELETE request failed with status {response.status_code} for endpoint {endpoint}")
+            logging.error(f"Response content: {response.text}")
+            return None
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"API connection failed: Cannot connect to {API_BASE_URL}{endpoint} - {e}")
+        return None
+    except requests.exceptions.Timeout as e:
+        logging.error(f"API request timeout: {endpoint} - {e}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API DELETE request failed for {endpoint}: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error for {endpoint}: {e}")
+        return None
+
 def test_api_connection():
     """Test if API is accessible"""
     try:
@@ -85,7 +113,7 @@ def test_api_connection():
 
 def update_system_data():
     """Update system data in background thread"""
-    global system_status, accounts_data, trades_data, logs_data
+    global system_status, accounts_data, trades_data, logs_data, copy_configs_data
     
     # Wait a bit for the API server to start
     time.sleep(5)
@@ -107,6 +135,12 @@ def update_system_data():
             if accounts is not None:
                 accounts_data = accounts
                 socketio.emit('accounts_update', accounts)
+            
+            # Update copy trading configurations
+            copy_configs = fetch_api_data("/copy-trading-config")
+            if copy_configs is not None:
+                copy_configs_data = copy_configs
+                socketio.emit('copy_configs_update', copy_configs)
             
             # Update trades data
             trades = fetch_api_data("/trades")
@@ -234,7 +268,8 @@ def create_account():
 @app.route('/api/accounts/<int:account_id>/delete', methods=['POST'])
 def delete_account(account_id):
     """Delete account"""
-    result = post_api_data(f"/accounts/{account_id}", {})
+    logging.info(f"Dashboard delete_account called for account_id: {account_id}")
+    result = delete_api_data(f"/accounts/{account_id}")
     if result:
         flash("Account deleted successfully", "success")
     else:
@@ -254,8 +289,30 @@ def create_copy_config():
     result = post_api_data("/copy-trading-config", data)
     if result:
         flash("Copy trading configuration created successfully", "success")
+        # Emit update to refresh configs in real-time
+        fresh_configs = fetch_api_data("/copy-trading-config")
+        if fresh_configs is not None:
+            global copy_configs_data
+            copy_configs_data = fresh_configs
+            socketio.emit('copy_configs_update', fresh_configs)
     else:
         flash("Failed to create copy trading configuration", "error")
+    return redirect(url_for('config'))
+
+@app.route('/api/config/<int:config_id>/delete', methods=['POST'])
+def delete_copy_config(config_id):
+    """Delete copy trading configuration"""
+    result = delete_api_data(f"/copy-trading-config/{config_id}")
+    if result:
+        flash("Copy trading configuration deleted successfully", "success")
+        # Emit update to refresh configs in real-time
+        fresh_configs = fetch_api_data("/copy-trading-config")
+        if fresh_configs is not None:
+            global copy_configs_data
+            copy_configs_data = fresh_configs
+            socketio.emit('copy_configs_update', fresh_configs)
+    else:
+        flash("Failed to delete copy trading configuration", "error")
     return redirect(url_for('config'))
 
 # WebSocket events
@@ -306,6 +363,20 @@ def handle_trades_request():
 def handle_logs_request():
     """Handle logs request"""
     emit('logs_update', logs_data)
+
+@socketio.on('request_copy_configs')
+def handle_copy_configs_request():
+    """Handle copy trading configs request"""
+    global copy_configs_data
+    try:
+        # Try to fetch fresh data from API
+        fresh_configs = fetch_api_data("/copy-trading-config")
+        if fresh_configs is not None:
+            copy_configs_data = fresh_configs
+        emit('copy_configs_update', copy_configs_data if copy_configs_data else [])
+    except Exception as e:
+        logging.error(f"Error handling copy configs request: {e}")
+        emit('copy_configs_update', [])
 
 if __name__ == '__main__':
     # Start background thread for data updates

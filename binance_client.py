@@ -22,14 +22,14 @@ class BinanceClient:
             self.client = Client(api_key, secret_key, testnet=True)
             try:
                 # Ensure python-binance uses Futures TESTNET REST base
-                # USD-M Futures (fapi)
-                self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+                # USD-M Futures (fapi) - correct testnet URL
+                self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi/v1/"
                 # Optional: Futures data endpoint
                 if hasattr(self.client, "FUTURES_DATA_URL"):
-                    self.client.FUTURES_DATA_URL = "https://testnet.binancefuture.com/futures/data"
+                    self.client.FUTURES_DATA_URL = "https://testnet.binancefuture.com/futures/data/"
                 # Optional: COIN-M Futures (not used here, but set to testnet just in case)
                 if hasattr(self.client, "FUTURES_COIN_URL"):
-                    self.client.FUTURES_COIN_URL = "https://testnet.binancefuture.com/dapi"
+                    self.client.FUTURES_COIN_URL = "https://testnet.binancefuture.com/dapi/v1/"
             except Exception:
                 pass
             self.base_url = "https://testnet.binancefuture.com"
@@ -46,11 +46,63 @@ class BinanceClient:
         try:
             import asyncio
             loop = asyncio.get_event_loop()
-            # Run the sync call in a thread pool to avoid blocking
+            
+            # Try different endpoints to find what works
+            logger.info(f"Testing connection - API Key: {self.api_key[:8]}..., Testnet: {self.testnet}")
+            
+            # First try ping
+            try:
+                ping_result = await loop.run_in_executor(None, self.client.ping)
+                logger.info("Ping successful")
+            except Exception as e:
+                logger.error(f"Ping failed: {e}")
+            
+            # Try futures_account with better error handling
             account = await loop.run_in_executor(None, self.client.futures_account)
+            logger.info(f"futures_account() successful. Balance: {account.get('availableBalance', 'N/A')}")
             return True
+            
+        except BinanceAPIException as e:
+            logger.error(f"Binance API error in futures_account(): Code {e.code}, Message: {e.message}")
+            
+            # Try alternative endpoint for testing
+            try:
+                logger.info("Trying alternative: futures_exchange_info()")
+                exchange_info = await loop.run_in_executor(None, self.client.futures_exchange_info)
+                logger.info("futures_exchange_info() works - API connection OK but account access failed")
+                return False
+            except Exception as e2:
+                logger.error(f"futures_exchange_info() also failed: {e2}")
+                return False
+                
         except Exception as e:
-            logger.error(f"Connection test failed: {e}")
+            logger.error(f"futures_account() failed with general error: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            
+            # Try a simpler test
+            try:
+                logger.info("Trying server time check...")
+                server_time = await loop.run_in_executor(None, self.client.get_server_time)
+                logger.info(f"Server time works: {server_time}")
+                logger.error("Server connection OK but futures_account() specifically fails")
+            except Exception as e2:
+                logger.error(f"Even server time failed: {e2}")
+            
+            return False
+    
+    async def test_connection_alternative(self) -> bool:
+        """Alternative connection test that doesn't use futures_account()"""
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            
+            # Test with futures_exchange_info (public endpoint, doesn't need account permissions)
+            exchange_info = await loop.run_in_executor(None, self.client.futures_exchange_info)
+            logger.info("Alternative connection test successful using futures_exchange_info()")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Alternative connection test failed: {e}")
             return False
     
     async def get_account_info(self) -> Dict:
@@ -106,7 +158,9 @@ class BinanceClient:
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage for a symbol"""
         try:
-            result = self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
+            import asyncio
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: self.client.futures_change_leverage(symbol=symbol, leverage=leverage))
             logger.info(f"Leverage set to {leverage}x for {symbol}")
             return True
         except Exception as e:
@@ -116,12 +170,14 @@ class BinanceClient:
     async def place_market_order(self, symbol: str, side: str, quantity: float) -> Dict:
         """Place a market order"""
         try:
-            order = self.client.futures_create_order(
+            import asyncio
+            loop = asyncio.get_event_loop()
+            order = await loop.run_in_executor(None, lambda: self.client.futures_create_order(
                 symbol=symbol,
                 side=side,
                 type='MARKET',
                 quantity=quantity
-            )
+            ))
             logger.info(f"Market order placed: {symbol} {side} {quantity}")
             return order
         except BinanceOrderException as e:
@@ -134,14 +190,16 @@ class BinanceClient:
     async def place_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Dict:
         """Place a limit order"""
         try:
-            order = self.client.futures_create_order(
+            import asyncio
+            loop = asyncio.get_event_loop()
+            order = await loop.run_in_executor(None, lambda: self.client.futures_create_order(
                 symbol=symbol,
                 side=side,
                 type='LIMIT',
                 timeInForce='GTC',
                 quantity=quantity,
                 price=price
-            )
+            ))
             logger.info(f"Limit order placed: {symbol} {side} {quantity} @ {price}")
             return order
         except BinanceOrderException as e:
