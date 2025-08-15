@@ -152,10 +152,15 @@ class CopyTradingEngine:
     async def monitor_master_account(self, master_id: int, client: BinanceClient):
         """Monitor a specific master account for new trades"""
         try:
-            logger.info(f"Starting monitoring for master account {master_id}")
+            logger.info(f"🔍 Starting monitoring for master account {master_id}")
+            loop_count = 0
             
             while self.is_running:
                 try:
+                    loop_count += 1
+                    if loop_count % 60 == 0:  # Log every 60 loops (about 1 minute)
+                        logger.info(f"📊 Monitoring master {master_id} - Loop {loop_count}")
+                    
                     # Get recent trades from master account
                     await self.check_master_trades(master_id, client)
                     
@@ -163,23 +168,81 @@ class CopyTradingEngine:
                     await asyncio.sleep(Config.TRADE_SYNC_DELAY)
                     
                 except asyncio.CancelledError:
+                    logger.info(f"⏹️ Monitoring cancelled for master {master_id}")
                     break
                 except Exception as e:
-                    logger.error(f"Error monitoring master account {master_id}: {e}")
+                    logger.error(f"❌ Error monitoring master account {master_id}: {e}")
                     await asyncio.sleep(5)  # Wait before retrying
                     
         except Exception as e:
-            logger.error(f"Failed to monitor master account {master_id}: {e}")
+            logger.error(f"💥 Failed to monitor master account {master_id}: {e}")
+        finally:
+            logger.info(f"🔚 Stopped monitoring master account {master_id}")
     
     async def check_master_trades(self, master_id: int, client: BinanceClient):
-        """Check for new trades in master account"""
+        """Check for new trades in master account using Binance API"""
         try:
-            session = get_session()
-            
             # Get the last trade timestamp for this master
             last_check = self.last_trade_check.get(master_id, datetime.utcnow() - timedelta(hours=1))
             
-            # Get recent trades from database (you might want to implement a more sophisticated way)
+            # Get recent trades from Binance API directly
+            logger.debug(f"Checking trades for master {master_id} since {last_check}")
+            
+            try:
+                # Get recent orders from Binance
+                recent_orders = await self.get_recent_orders(client, last_check)
+                
+                if recent_orders:
+                    logger.info(f"Found {len(recent_orders)} recent orders for master {master_id}")
+                    
+                    for order in recent_orders:
+                        await self.process_master_order(master_id, order)
+                else:
+                    logger.debug(f"No recent orders found for master {master_id}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to get orders from Binance for master {master_id}: {e}")
+                # Fallback to database check
+                await self.check_database_trades(master_id, last_check)
+            
+            # Update last check time
+            self.last_trade_check[master_id] = datetime.utcnow()
+            
+        except Exception as e:
+            logger.error(f"Error checking master trades: {e}")
+    
+    async def get_recent_orders(self, client: BinanceClient, since_time: datetime):
+        """Get recent orders from Binance API"""
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            
+            # Convert datetime to timestamp
+            start_time = int(since_time.timestamp() * 1000)
+            
+            # Get all orders since last check
+            orders = await loop.run_in_executor(
+                None, 
+                lambda: client.client.futures_get_all_orders(startTime=start_time)
+            )
+            
+            # Filter for filled orders only
+            filled_orders = [
+                order for order in orders 
+                if order['status'] == 'FILLED' and order['side'] in ['BUY', 'SELL']
+            ]
+            
+            return filled_orders
+            
+        except Exception as e:
+            logger.error(f"Error getting recent orders: {e}")
+            return []
+    
+    async def check_database_trades(self, master_id: int, last_check: datetime):
+        """Fallback method to check database for trades"""
+        try:
+            session = get_session()
+            
             recent_trades = session.query(Trade).filter(
                 Trade.account_id == master_id,
                 Trade.created_at > last_check,
@@ -189,13 +252,42 @@ class CopyTradingEngine:
             for trade in recent_trades:
                 await self.copy_trade_to_followers(trade, session)
             
-            # Update last check time
-            self.last_trade_check[master_id] = datetime.utcnow()
+            session.close()
+            
+        except Exception as e:
+            logger.error(f"Error checking database trades: {e}")
+    
+    async def process_master_order(self, master_id: int, order: dict):
+        """Process a filled order from master account"""
+        try:
+            logger.info(f"🎯 Processing master order: {order['symbol']} {order['side']} {order['executedQty']}")
+            
+            # Create trade record in database
+            session = get_session()
+            
+            db_trade = Trade(
+                account_id=master_id,
+                symbol=order['symbol'],
+                side=order['side'],
+                order_type=order['type'],
+                quantity=float(order['executedQty']),
+                price=float(order['avgPrice']) if order.get('avgPrice') else float(order['price']),
+                status='FILLED',
+                binance_order_id=order['orderId'],
+                copied_from_master=False
+            )
+            
+            session.add(db_trade)
+            session.commit()
+            session.refresh(db_trade)
+            
+            # Copy to followers
+            await self.copy_trade_to_followers(db_trade, session)
             
             session.close()
             
         except Exception as e:
-            logger.error(f"Error checking master trades: {e}")
+            logger.error(f"Error processing master order: {e}")
     
     async def copy_trade_to_followers(self, master_trade: Trade, session: Session):
         """Copy a master trade to all follower accounts"""
