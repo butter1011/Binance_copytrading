@@ -573,6 +573,16 @@ class CopyTradingEngine:
                 logger.warning(f"⚠️ Could not check/set position mode (may have open positions or limited permissions): {mode_error}")
                 # Continue - this is not critical for trading
             
+            # Adjust quantity precision for symbol requirements
+            try:
+                adjusted_quantity = await follower_client.adjust_quantity_precision(master_trade.symbol, quantity)
+                if adjusted_quantity != quantity:
+                    logger.info(f"📏 Quantity adjusted for precision: {quantity} -> {adjusted_quantity}")
+                    quantity = adjusted_quantity
+            except Exception as precision_error:
+                logger.warning(f"⚠️ Could not adjust quantity precision: {precision_error}")
+                # Continue with original quantity
+            
             # Validate trade parameters before placing order
             logger.info(f"🎯 Placing follower order: {master_trade.symbol} {master_trade.side} {quantity} ({master_trade.order_type})")
             
@@ -642,7 +652,26 @@ class CopyTradingEngine:
             logger.info(f"Successfully copied trade to follower {config.follower_account_id}")
             
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"Error placing follower trade: {e}")
+            
+            # Provide specific guidance based on error type
+            if "code=-4061" in error_msg:
+                logger.error("❌ Position side mismatch error - this should be fixed with the recent updates")
+                logger.info("🔧 Try restarting the application to ensure the position mode fixes are active")
+            elif "code=-1022" in error_msg:
+                logger.error("❌ Signature validation error - check API key permissions for subaccount")
+            elif "code=-2015" in error_msg:
+                logger.error("❌ Permission denied - subaccount may not have futures trading permissions")
+            elif "code=-2019" in error_msg:
+                logger.error("❌ Margin insufficient - subaccount may not have enough balance")
+            elif "code=-1013" in error_msg:
+                logger.error("❌ Invalid quantity - check minimum order size requirements")
+            elif "code=-4003" in error_msg:
+                logger.error("❌ Quantity precision error - adjusting quantity precision")
+            else:
+                logger.error(f"❌ Unhandled error: {error_msg}")
+            
             session.rollback()
     
     async def get_engine_status(self) -> Dict:
