@@ -234,7 +234,11 @@ class CopyTradingEngine:
                 open_orders = await client.get_open_orders()
                 if open_orders:
                     logger.info(f"📋 Retrieved {len(open_orders)} open orders")
+                    for order in open_orders:
+                        logger.info(f"📋 Open order details: ID={order['orderId']}, Symbol={order['symbol']}, Side={order['side']}, Status={order['status']}, Time={order['time']}")
                     all_orders.extend(open_orders)
+                else:
+                    logger.debug("📋 No open orders found")
             except Exception as e:
                 logger.warning(f"⚠️ Failed to get open orders: {e}")
             
@@ -255,13 +259,33 @@ class CopyTradingEngine:
             
             for order in all_orders:
                 order_id = order['orderId']
+                order_time = int(order['time'])
+                order_status = order['status']
+                
+                # Include orders if:
+                # 1. They are open orders (NEW/PARTIALLY_FILLED) - regardless of time
+                # 2. They are recent filled orders (within time range)
+                is_open_order = order_status in ['NEW', 'PARTIALLY_FILLED']
+                is_recent_filled = order_status == 'FILLED' and order_time >= start_time
+                
                 if (order_id not in seen_orders and 
                     order['side'] in ['BUY', 'SELL'] and 
-                    order['status'] in ['NEW', 'PARTIALLY_FILLED', 'FILLED'] and
-                    int(order['time']) >= start_time):
+                    order_status in ['NEW', 'PARTIALLY_FILLED', 'FILLED'] and
+                    (is_open_order or is_recent_filled)):
                     seen_orders.add(order_id)
                     relevant_orders.append(order)
-                    logger.info(f"🎯 Found order: {order['symbol']} {order['side']} {order['origQty']} - Status: {order['status']}")
+                    status_note = "📋 OPEN" if is_open_order else "🏁 RECENT"
+                    logger.info(f"🎯 Found order {status_note}: {order['symbol']} {order['side']} {order['origQty']} - Status: {order_status}")
+                else:
+                    # Log why orders are being filtered out
+                    if order_id in seen_orders:
+                        logger.debug(f"⏭️ Skipping duplicate order: {order_id}")
+                    elif order['side'] not in ['BUY', 'SELL']:
+                        logger.debug(f"⏭️ Skipping non-trading order: {order_id} (side: {order['side']})")
+                    elif order_status not in ['NEW', 'PARTIALLY_FILLED', 'FILLED']:
+                        logger.debug(f"⏭️ Skipping order with status: {order_id} (status: {order_status})")
+                    elif not (is_open_order or is_recent_filled):
+                        logger.debug(f"⏭️ Skipping old order: {order_id} (time: {order_time}, threshold: {start_time})")
             
             logger.info(f"✅ Found {len(relevant_orders)} relevant orders (open + filled)")
             return relevant_orders

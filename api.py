@@ -484,6 +484,49 @@ async def force_check_trades():
         logger.error(f"Error in manual trade check: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/debug/orders/{account_id}")
+async def debug_orders(account_id: int, db = Depends(get_db)):
+    """Debug endpoint to check what orders are being detected"""
+    try:
+        account = db.query(Account).filter(Account.id == account_id).first()
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+        
+        client = BinanceClient(
+            api_key=account.api_key,
+            secret_key=account.secret_key,
+            testnet=Config.BINANCE_TESTNET
+        )
+        
+        # Test connection
+        connected = await client.test_connection()
+        if not connected:
+            return {"error": "Failed to connect to Binance API"}
+        
+        # Get open orders
+        open_orders = await client.get_open_orders()
+        
+        # Get recent orders from copy trading engine
+        from datetime import timedelta
+        since_time = datetime.utcnow() - timedelta(hours=1)
+        recent_orders = await copy_trading_engine.get_recent_orders(client, since_time)
+        
+        return {
+            "account_id": account_id,
+            "account_name": account.name,
+            "connection_status": "connected",
+            "open_orders_count": len(open_orders),
+            "open_orders": open_orders,
+            "recent_orders_count": len(recent_orders),
+            "recent_orders": recent_orders,
+            "processed_orders": list(copy_trading_engine.processed_orders.get(account_id, set())),
+            "timestamp": datetime.utcnow()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in debug orders: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # System logs
 @app.get("/logs", response_model=List[Dict])
 async def get_logs(level: Optional[str] = None, limit: int = 100, db = Depends(get_db)):
