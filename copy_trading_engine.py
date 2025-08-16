@@ -338,8 +338,22 @@ class CopyTradingEngine:
                 logger.debug(f"🆕 Initialized processed_orders for master {master_id}")
             
             if order_id in self.processed_orders[master_id]:
-                logger.debug(f"⏭️ Order {order_id} already processed, skipping")
-                return
+                logger.warning(f"⚠️ Order {order_id} was marked as processed but may not be in database - checking...")
+                # Check if the order actually exists in the database
+                session_check = get_session()
+                existing_trade = session_check.query(Trade).filter(
+                    Trade.binance_order_id == order_id,
+                    Trade.account_id == master_id
+                ).first()
+                session_check.close()
+                
+                if existing_trade:
+                    logger.debug(f"✅ Order {order_id} exists in database, skipping")
+                    return
+                else:
+                    logger.warning(f"🔄 Order {order_id} NOT in database - reprocessing...")
+                    # Remove from processed set so we can reprocess
+                    self.processed_orders[master_id].discard(order_id)
             
             logger.info(f"📋 Processing NEW master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status}")
             
@@ -476,8 +490,14 @@ class CopyTradingEngine:
     async def calculate_follower_quantity(self, master_trade: Trade, config: CopyTradingConfig, follower_client: BinanceClient) -> float:
         """Calculate the quantity for follower trade based on risk management"""
         try:
-            # Get follower account balance
+            # Get follower account balance (handle subaccount limitations)
             follower_balance = await follower_client.get_balance()
+            
+            # For subaccounts with limited permissions, use a default balance if balance retrieval fails
+            if follower_balance <= 0:
+                logger.warning(f"⚠️ Could not get balance for follower account, using master trade quantity")
+                # Use the same quantity as master trade (1:1 copy)
+                return master_trade.quantity * (config.copy_percentage / 100.0)
             
             # Calculate risk amount based on follower's risk percentage
             session = get_session()
@@ -485,35 +505,50 @@ class CopyTradingEngine:
             session.close()
             
             if not follower_account:
+                logger.error(f"❌ Follower account {config.follower_account_id} not found in database")
                 return 0
             
             risk_amount = follower_balance * (follower_account.risk_percentage / 100.0)
             risk_amount *= config.risk_multiplier
             
             # Calculate position size
-            quantity = await follower_client.calculate_position_size(
-                master_trade.symbol,
-                risk_amount,
-                follower_account.leverage
-            )
+            try:
+                quantity = await follower_client.calculate_position_size(
+                    master_trade.symbol,
+                    risk_amount,
+                    follower_account.leverage
+                )
+            except Exception as calc_error:
+                logger.warning(f"⚠️ Position size calculation failed for subaccount: {calc_error}")
+                # Fallback: Use master quantity scaled by copy percentage
+                quantity = master_trade.quantity
             
             # Apply copy percentage
             quantity *= (config.copy_percentage / 100.0)
             
+            logger.info(f"📊 Calculated follower quantity: {quantity} (master: {master_trade.quantity}, copy%: {config.copy_percentage}%)")
             return quantity
             
         except Exception as e:
             logger.error(f"Error calculating follower quantity: {e}")
-            return 0
+            # Fallback: Use master quantity scaled by copy percentage
+            fallback_quantity = master_trade.quantity * (config.copy_percentage / 100.0)
+            logger.warning(f"⚠️ Using fallback quantity: {fallback_quantity}")
+            return fallback_quantity
     
     async def place_follower_trade(self, master_trade: Trade, config: CopyTradingConfig, quantity: float, session: Session):
         """Place the trade on follower account"""
         try:
             follower_client = self.follower_clients[config.follower_account_id]
             
-            # Set leverage if needed
+            # Set leverage if needed (handle subaccount limitations)
             follower_account = session.query(Account).filter(Account.id == config.follower_account_id).first()
-            await follower_client.set_leverage(master_trade.symbol, follower_account.leverage)
+            try:
+                await follower_client.set_leverage(master_trade.symbol, follower_account.leverage)
+                logger.info(f"✅ Set leverage {follower_account.leverage}x for {master_trade.symbol}")
+            except Exception as leverage_error:
+                logger.warning(f"⚠️ Could not set leverage for subaccount (normal for limited permissions): {leverage_error}")
+                # Continue without setting leverage - subaccounts often can't change leverage
             
             # Place the order based on order type
             if master_trade.order_type == "MARKET":

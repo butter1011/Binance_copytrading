@@ -570,6 +570,22 @@ async def debug_process_order(account_id: int, order_id: str, db = Depends(get_d
         logger.error(f"Error in debug process order: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/debug/clear-processed/{account_id}")
+async def clear_processed_orders(account_id: int):
+    """Clear processed orders cache for an account (for debugging)"""
+    try:
+        if account_id in copy_trading_engine.processed_orders:
+            count = len(copy_trading_engine.processed_orders[account_id])
+            copy_trading_engine.processed_orders[account_id].clear()
+            logger.info(f"🧹 Cleared {count} processed orders for account {account_id}")
+            return {"message": f"Cleared {count} processed orders for account {account_id}"}
+        else:
+            return {"message": f"No processed orders found for account {account_id}"}
+            
+    except Exception as e:
+        logger.error(f"Error clearing processed orders: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # System logs
 @app.get("/logs", response_model=List[Dict])
 async def get_logs(level: Optional[str] = None, limit: int = 100, db = Depends(get_db)):
