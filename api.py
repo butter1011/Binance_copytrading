@@ -527,6 +527,49 @@ async def debug_orders(account_id: int, db = Depends(get_db)):
         logger.error(f"Error in debug orders: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/debug/process-order/{account_id}/{order_id}")
+async def debug_process_order(account_id: int, order_id: str, db = Depends(get_db)):
+    """Debug endpoint to manually process a specific order"""
+    try:
+        account = db.query(Account).filter(Account.id == account_id).first()
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+        
+        if not account.is_master:
+            raise HTTPException(status_code=400, detail="Account must be a master account")
+        
+        client = BinanceClient(
+            api_key=account.api_key,
+            secret_key=account.secret_key,
+            testnet=Config.BINANCE_TESTNET
+        )
+        
+        # Get open orders and find the specific order
+        open_orders = await client.get_open_orders()
+        target_order = None
+        for order in open_orders:
+            if str(order['orderId']) == order_id:
+                target_order = order
+                break
+        
+        if not target_order:
+            return {"error": f"Order {order_id} not found in open orders"}
+        
+        logger.info(f"🔧 Debug: Manually processing order {order_id} for account {account_id}")
+        
+        # Process the order
+        await copy_trading_engine.process_master_order(account_id, target_order)
+        
+        return {
+            "message": f"Order {order_id} processed successfully",
+            "order_details": target_order,
+            "timestamp": datetime.utcnow()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in debug process order: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # System logs
 @app.get("/logs", response_model=List[Dict])
 async def get_logs(level: Optional[str] = None, limit: int = 100, db = Depends(get_db)):

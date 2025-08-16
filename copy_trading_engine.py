@@ -27,6 +27,7 @@ class CopyTradingEngine:
         self.monitoring_tasks = {}
         self.last_trade_check = {}
         self.processed_orders = {}  # account_id -> set of order_ids to avoid duplicates
+        logger.info("🏗️ CopyTradingEngine initialized")
         
     async def initialize(self):
         """Initialize the copy trading engine"""
@@ -200,7 +201,14 @@ class CopyTradingEngine:
                     logger.info(f"Found {len(recent_orders)} recent orders for master {master_id}")
                     
                     for order in recent_orders:
-                        await self.process_master_order(master_id, order)
+                        try:
+                            logger.info(f"📝 About to process order {order['orderId']} for master {master_id}")
+                            await self.process_master_order(master_id, order)
+                            logger.info(f"✅ Successfully processed order {order['orderId']} for master {master_id}")
+                        except Exception as order_error:
+                            logger.error(f"❌ Error processing order {order['orderId']} for master {master_id}: {order_error}")
+                            import traceback
+                            logger.error(f"Full traceback: {traceback.format_exc()}")
                 else:
                     logger.debug(f"No recent orders found for master {master_id}")
                     
@@ -315,24 +323,29 @@ class CopyTradingEngine:
     
     async def process_master_order(self, master_id: int, order: dict):
         """Process an order from master account (open, partially filled, or filled)"""
+        session = None
         try:
             order_id = str(order['orderId'])
             order_status = order['status']
             executed_qty = float(order.get('executedQty', 0))
             original_qty = float(order['origQty'])
             
+            logger.info(f"🎯 Starting to process master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status}")
+            
             # Check if we've already processed this order
             if master_id not in self.processed_orders:
                 self.processed_orders[master_id] = set()
+                logger.debug(f"🆕 Initialized processed_orders for master {master_id}")
             
             if order_id in self.processed_orders[master_id]:
                 logger.debug(f"⏭️ Order {order_id} already processed, skipping")
                 return
             
-            logger.info(f"🎯 Processing master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status}")
+            logger.info(f"📋 Processing NEW master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status}")
             
             # Mark this order as processed (with cleanup to prevent memory leaks)
             self.processed_orders[master_id].add(order_id)
+            logger.debug(f"✔️ Marked order {order_id} as processed")
             
             # Clean up old processed orders to prevent memory leaks (keep only last 1000)
             if len(self.processed_orders[master_id]) > 1000:
@@ -340,9 +353,12 @@ class CopyTradingEngine:
                 sorted_orders = sorted(self.processed_orders[master_id])
                 # Keep only the most recent 500 orders
                 self.processed_orders[master_id] = set(sorted_orders[-500:])
+                logger.debug(f"🧹 Cleaned up processed orders for master {master_id}")
             
             # Create trade record in database
+            logger.info(f"💾 Creating database session...")
             session = get_session()
+            logger.info(f"💾 Database session created successfully")
             
             # Determine the status and quantity to record
             if order_status == 'NEW':
@@ -374,9 +390,13 @@ class CopyTradingEngine:
                 copied_from_master=False
             )
             
+            logger.info(f"💾 Adding trade to database...")
             session.add(db_trade)
+            logger.info(f"💾 Committing trade to database...")
             session.commit()
+            logger.info(f"💾 Refreshing trade from database...")
             session.refresh(db_trade)
+            logger.info(f"✅ Trade {db_trade.id} saved to database successfully")
             
             # Copy to followers immediately when orders are placed (NEW) or filled
             # This ensures followers trade simultaneously with master, not after completion
@@ -400,10 +420,21 @@ class CopyTradingEngine:
             else:
                 logger.info(f"📝 Order recorded but not copied (status: {order_status})")
             
+            logger.info(f"🔒 Closing database session...")
             session.close()
+            logger.info(f"✅ Master order {order_id} processed completely")
             
         except Exception as e:
             logger.error(f"❌ Error processing master order: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            if session:
+                try:
+                    session.rollback()
+                    session.close()
+                    logger.info(f"🔒 Database session closed after error")
+                except Exception as cleanup_error:
+                    logger.error(f"❌ Error cleaning up database session: {cleanup_error}")
     
     async def copy_trade_to_followers(self, master_trade: Trade, session: Session):
         """Copy a master trade to all follower accounts"""
