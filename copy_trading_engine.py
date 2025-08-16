@@ -461,11 +461,22 @@ class CopyTradingEngine:
                 CopyTradingConfig.is_active == True
             ).all()
             
+            logger.info(f"📋 Found {len(configs)} active copy trading configurations for master {master_trade.account_id}")
+            if len(configs) == 0:
+                logger.warning(f"⚠️ No copy trading configurations found for master {master_trade.account_id}")
+                logger.info(f"🔧 To set up copy trading, create a configuration linking master {master_trade.account_id} to follower accounts")
+                return
+            
             for config in configs:
+                logger.info(f"🔗 Processing copy config: Master {config.master_account_id} -> Follower {config.follower_account_id} (Copy: {config.copy_percentage}%)")
+                
                 follower_client = self.follower_clients.get(config.follower_account_id)
                 if not follower_client:
-                    logger.warning(f"Follower client not found for account {config.follower_account_id}")
+                    logger.warning(f"❌ Follower client not found for account {config.follower_account_id}")
+                    logger.info(f"🔧 Available follower clients: {list(self.follower_clients.keys())}")
                     continue
+                
+                logger.info(f"✅ Found follower client for account {config.follower_account_id}")
                 
                 # Calculate position size for follower
                 follower_quantity = await self.calculate_follower_quantity(
@@ -541,7 +552,7 @@ class CopyTradingEngine:
         try:
             follower_client = self.follower_clients[config.follower_account_id]
             
-            # Set leverage if needed (handle subaccount limitations)
+            # Set leverage and position mode if needed (handle subaccount limitations)
             follower_account = session.query(Account).filter(Account.id == config.follower_account_id).first()
             try:
                 await follower_client.set_leverage(master_trade.symbol, follower_account.leverage)
@@ -549,6 +560,21 @@ class CopyTradingEngine:
             except Exception as leverage_error:
                 logger.warning(f"⚠️ Could not set leverage for subaccount (normal for limited permissions): {leverage_error}")
                 # Continue without setting leverage - subaccounts often can't change leverage
+            
+            # Ensure position mode is set to One-way (default) to avoid position side conflicts
+            try:
+                current_mode = await follower_client.get_position_mode()
+                if current_mode:  # If in hedge mode, try to switch to one-way mode
+                    logger.info(f"📊 Follower account is in hedge mode, attempting to switch to one-way mode")
+                    await follower_client.set_position_mode(dual_side_position=False)
+                else:
+                    logger.info(f"📊 Follower account is already in one-way mode")
+            except Exception as mode_error:
+                logger.warning(f"⚠️ Could not check/set position mode (may have open positions or limited permissions): {mode_error}")
+                # Continue - this is not critical for trading
+            
+            # Validate trade parameters before placing order
+            logger.info(f"🎯 Placing follower order: {master_trade.symbol} {master_trade.side} {quantity} ({master_trade.order_type})")
             
             # Place the order based on order type
             if master_trade.order_type == "MARKET":
@@ -581,6 +607,8 @@ class CopyTradingEngine:
             else:
                 logger.warning(f"Unsupported order type: {master_trade.order_type}")
                 return
+            
+            logger.info(f"✅ Follower order placed successfully: Order ID {order.get('orderId', 'Unknown')}")
             
             # Save follower trade to database
             follower_trade = Trade(
