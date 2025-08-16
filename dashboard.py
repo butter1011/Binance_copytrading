@@ -228,6 +228,16 @@ def initialize_system():
         flash("Failed to initialize system", "error")
     return redirect(url_for('index'))
 
+@app.route('/api/system/force-check-trades', methods=['POST'])
+def force_check_trades():
+    """Force immediate check for new trades"""
+    result = post_api_data("/force-check-trades", {})
+    if result:
+        flash("Manual trade check completed - check logs for details", "success")
+    else:
+        flash("Failed to check trades", "error")
+    return redirect(url_for('index'))
+
 @app.route('/api/accounts/create', methods=['POST'])
 def create_account():
     """Create new account"""

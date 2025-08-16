@@ -26,6 +26,7 @@ class CopyTradingEngine:
         self.is_running = False
         self.monitoring_tasks = {}
         self.last_trade_check = {}
+        self.processed_orders = {}  # account_id -> set of order_ids to avoid duplicates
         
     async def initialize(self):
         """Initialize the copy trading engine"""
@@ -128,6 +129,9 @@ class CopyTradingEngine:
             task = asyncio.create_task(self.monitor_master_account(master_id, client))
             self.monitoring_tasks[master_id] = task
             self.last_trade_check[master_id] = datetime.utcnow()
+            # Initialize processed orders tracking for this master
+            if master_id not in self.processed_orders:
+                self.processed_orders[master_id] = set()
         
         logger.info(f"Started monitoring {len(self.master_clients)} master accounts")
     
@@ -212,7 +216,7 @@ class CopyTradingEngine:
             logger.error(f"Error checking master trades: {e}")
     
     async def get_recent_orders(self, client: BinanceClient, since_time: datetime):
-        """Get recent orders from Binance API"""
+        """Get recent orders from Binance API - includes both open and filled orders"""
         try:
             import asyncio
             loop = asyncio.get_event_loop()
@@ -220,22 +224,50 @@ class CopyTradingEngine:
             # Convert datetime to timestamp
             start_time = int(since_time.timestamp() * 1000)
             
-            # Get all orders since last check
-            orders = await loop.run_in_executor(
-                None, 
-                lambda: client.client.futures_get_all_orders(startTime=start_time)
-            )
+            logger.info(f"🔍 Fetching orders since {since_time}")
             
-            # Filter for filled orders only
-            filled_orders = [
-                order for order in orders 
-                if order['status'] == 'FILLED' and order['side'] in ['BUY', 'SELL']
-            ]
+            # Get both open orders and recent historical orders
+            all_orders = []
             
-            return filled_orders
+            # 1. Get current open orders (these should be copied immediately)
+            try:
+                open_orders = await client.get_open_orders()
+                if open_orders:
+                    logger.info(f"📋 Retrieved {len(open_orders)} open orders")
+                    all_orders.extend(open_orders)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to get open orders: {e}")
+            
+            # 2. Get recent historical orders
+            try:
+                historical_orders = await loop.run_in_executor(
+                    None, 
+                    lambda: client.client.futures_get_all_orders(startTime=start_time, limit=100)
+                )
+                logger.info(f"📊 Retrieved {len(historical_orders)} historical orders from Binance")
+                all_orders.extend(historical_orders)
+            except Exception as e:
+                logger.error(f"❌ Failed to get historical orders: {e}")
+            
+            # Remove duplicates based on orderId and filter for relevant orders
+            seen_orders = set()
+            relevant_orders = []
+            
+            for order in all_orders:
+                order_id = order['orderId']
+                if (order_id not in seen_orders and 
+                    order['side'] in ['BUY', 'SELL'] and 
+                    order['status'] in ['NEW', 'PARTIALLY_FILLED', 'FILLED'] and
+                    int(order['time']) >= start_time):
+                    seen_orders.add(order_id)
+                    relevant_orders.append(order)
+                    logger.info(f"🎯 Found order: {order['symbol']} {order['side']} {order['origQty']} - Status: {order['status']}")
+            
+            logger.info(f"✅ Found {len(relevant_orders)} relevant orders (open + filled)")
+            return relevant_orders
             
         except Exception as e:
-            logger.error(f"Error getting recent orders: {e}")
+            logger.error(f"❌ Error getting recent orders: {e}")
             return []
     
     async def check_database_trades(self, master_id: int, last_check: datetime):
@@ -258,22 +290,63 @@ class CopyTradingEngine:
             logger.error(f"Error checking database trades: {e}")
     
     async def process_master_order(self, master_id: int, order: dict):
-        """Process a filled order from master account"""
+        """Process an order from master account (open, partially filled, or filled)"""
         try:
-            logger.info(f"🎯 Processing master order: {order['symbol']} {order['side']} {order['executedQty']}")
+            order_id = str(order['orderId'])
+            order_status = order['status']
+            executed_qty = float(order.get('executedQty', 0))
+            original_qty = float(order['origQty'])
+            
+            # Check if we've already processed this order
+            if master_id not in self.processed_orders:
+                self.processed_orders[master_id] = set()
+            
+            if order_id in self.processed_orders[master_id]:
+                logger.debug(f"⏭️ Order {order_id} already processed, skipping")
+                return
+            
+            logger.info(f"🎯 Processing master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status}")
+            
+            # Mark this order as processed (with cleanup to prevent memory leaks)
+            self.processed_orders[master_id].add(order_id)
+            
+            # Clean up old processed orders to prevent memory leaks (keep only last 1000)
+            if len(self.processed_orders[master_id]) > 1000:
+                # Convert to list, sort by order_id (assuming newer orders have higher IDs)
+                sorted_orders = sorted(self.processed_orders[master_id])
+                # Keep only the most recent 500 orders
+                self.processed_orders[master_id] = set(sorted_orders[-500:])
             
             # Create trade record in database
             session = get_session()
+            
+            # Determine the status and quantity to record
+            if order_status == 'NEW':
+                db_status = 'PENDING'
+                quantity_to_record = original_qty
+                price_to_record = float(order.get('price', 0))
+            elif order_status == 'PARTIALLY_FILLED':
+                db_status = 'PARTIALLY_FILLED'
+                quantity_to_record = executed_qty
+                price_to_record = float(order.get('avgPrice', order.get('price', 0)))
+            elif order_status == 'FILLED':
+                db_status = 'FILLED'
+                quantity_to_record = executed_qty
+                price_to_record = float(order.get('avgPrice', order.get('price', 0)))
+            else:
+                logger.warning(f"⚠️ Unsupported order status: {order_status}")
+                session.close()
+                return
             
             db_trade = Trade(
                 account_id=master_id,
                 symbol=order['symbol'],
                 side=order['side'],
                 order_type=order['type'],
-                quantity=float(order['executedQty']),
-                price=float(order['avgPrice']) if order.get('avgPrice') else float(order['price']),
-                status='FILLED',
-                binance_order_id=order['orderId'],
+                quantity=quantity_to_record,
+                price=price_to_record,
+                status=db_status,
+                binance_order_id=str(order['orderId']),
                 copied_from_master=False
             )
             
@@ -281,13 +354,32 @@ class CopyTradingEngine:
             session.commit()
             session.refresh(db_trade)
             
-            # Copy to followers
-            await self.copy_trade_to_followers(db_trade, session)
+            # Copy to followers immediately when orders are placed (NEW) or filled
+            # This ensures followers trade simultaneously with master, not after completion
+            if order_status in ['NEW', 'FILLED']:
+                logger.info(f"🚀 Copying {order_status.lower()} order to followers immediately")
+                await self.copy_trade_to_followers(db_trade, session)
+            elif order_status == 'PARTIALLY_FILLED':
+                # For partially filled orders, check if we already copied this order
+                # to avoid duplicate trades
+                logger.info(f"📝 Partially filled order recorded, checking if already copied")
+                existing_copy = session.query(Trade).filter(
+                    Trade.master_trade_id == db_trade.id,
+                    Trade.copied_from_master == True
+                ).first()
+                
+                if not existing_copy:
+                    logger.info(f"🚀 Copying partially filled order to followers")
+                    await self.copy_trade_to_followers(db_trade, session)
+                else:
+                    logger.info(f"📝 Order already copied, skipping duplicate")
+            else:
+                logger.info(f"📝 Order recorded but not copied (status: {order_status})")
             
             session.close()
             
         except Exception as e:
-            logger.error(f"Error processing master order: {e}")
+            logger.error(f"❌ Error processing master order: {e}")
     
     async def copy_trade_to_followers(self, master_trade: Trade, session: Session):
         """Copy a master trade to all follower accounts"""

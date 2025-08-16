@@ -324,6 +324,30 @@ class BinanceClient:
             logger.error(f"Failed to cancel order: {e}")
             return False
     
+    async def get_open_orders(self, symbol: str = None) -> List[Dict]:
+        """Get all open orders for a symbol or all symbols"""
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            
+            if symbol:
+                orders = await loop.run_in_executor(None, lambda: self.client.futures_get_open_orders(symbol=symbol))
+            else:
+                orders = await loop.run_in_executor(None, self.client.futures_get_open_orders)
+            
+            logger.info(f"Retrieved {len(orders)} open orders" + (f" for {symbol}" if symbol else ""))
+            return orders
+        except BinanceAPIException as e:
+            if e.code == -2015:  # Permission denied
+                logger.warning(f"⚠️ Open orders access denied (Code -2015) - account has limited permissions")
+                return []
+            else:
+                logger.error(f"Failed to get open orders: {e}")
+                return []
+        except Exception as e:
+            logger.warning(f"Failed to get open orders (possibly limited permissions): {e}")
+            return []
+
     async def get_order_status(self, symbol: str, order_id: str) -> Dict:
         """Get order status"""
         try:

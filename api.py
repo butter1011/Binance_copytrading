@@ -459,6 +459,31 @@ async def initialize_system():
         logger.error(f"Error initializing system: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/force-check-trades")
+async def force_check_trades():
+    """Force immediate check for new trades in all master accounts"""
+    try:
+        logger.info("🔄 Manual trade check triggered")
+        results = {}
+        
+        for master_id, client in copy_trading_engine.master_clients.items():
+            try:
+                await copy_trading_engine.check_master_trades(master_id, client)
+                results[master_id] = "checked"
+                logger.info(f"✅ Manually checked trades for master {master_id}")
+            except Exception as e:
+                results[master_id] = f"error: {str(e)}"
+                logger.error(f"❌ Error checking master {master_id}: {e}")
+        
+        return {
+            "message": "Manual trade check completed",
+            "results": results,
+            "timestamp": datetime.utcnow()
+        }
+    except Exception as e:
+        logger.error(f"Error in manual trade check: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # System logs
 @app.get("/logs", response_model=List[Dict])
 async def get_logs(level: Optional[str] = None, limit: int = 100, db = Depends(get_db)):
@@ -526,6 +551,32 @@ async def get_account_positions(account_id: int, db = Depends(get_db)):
         
     except Exception as e:
         logger.error(f"Error getting account positions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/accounts/{account_id}/open-orders")
+async def get_account_open_orders(account_id: int, symbol: Optional[str] = None, db = Depends(get_db)):
+    """Get account open orders"""
+    try:
+        account = db.query(Account).filter(Account.id == account_id).first()
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+        
+        client = BinanceClient(
+            api_key=account.api_key,
+            secret_key=account.secret_key,
+            testnet=Config.BINANCE_TESTNET
+        )
+        
+        open_orders = await client.get_open_orders(symbol)
+        return {
+            "account_id": account_id,
+            "symbol": symbol,
+            "open_orders": open_orders,
+            "count": len(open_orders)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting account open orders: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
