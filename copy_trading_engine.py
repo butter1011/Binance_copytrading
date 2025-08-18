@@ -550,8 +550,11 @@ class CopyTradingEngine:
                 # Place the trade on follower account
                 try:
                     logger.info(f"🚀 About to place follower trade: {master_trade.symbol} {master_trade.side} {follower_quantity}")
-                    await self.place_follower_trade(master_trade, config, follower_quantity, session)
-                    logger.info(f"✅ Successfully placed follower trade for account {config.follower_account_id}")
+                    success = await self.place_follower_trade(master_trade, config, follower_quantity, session)
+                    if success:
+                        logger.info(f"✅ Successfully placed follower trade for account {config.follower_account_id}")
+                    else:
+                        logger.warning(f"⚠️ Follower trade was skipped for account {config.follower_account_id} (likely due to minimum notional or other validation)")
                 except Exception as follower_error:
                     logger.error(f"❌ FAILED TO PLACE FOLLOWER TRADE for account {config.follower_account_id}: {follower_error}")
                     import traceback
@@ -663,8 +666,40 @@ class CopyTradingEngine:
                 quantity = round(quantity, 1)
                 logger.info(f"📏 Applied safety precision rounding: -> {quantity}")
             
+            # Validate minimum notional value (Binance requires $5 minimum)
+            notional_value = quantity * master_trade.price if master_trade.price else 0
+            min_notional = 5.0  # $5 minimum for Binance futures
+            
+            if notional_value < min_notional and master_trade.price > 0:
+                logger.warning(f"⚠️ Order value ${notional_value:.2f} is below minimum ${min_notional}")
+                logger.warning(f"📊 Quantity: {quantity}, Price: {master_trade.price}")
+                
+                # Try to adjust quantity to meet minimum notional requirement
+                if master_trade.price > 0:
+                    min_quantity = min_notional / master_trade.price
+                    # Round up to next valid quantity step
+                    try:
+                        adjusted_min_quantity = await follower_client.adjust_quantity_precision(master_trade.symbol, min_quantity)
+                        if adjusted_min_quantity > quantity:
+                            logger.info(f"🔧 Adjusting quantity to meet minimum notional: {quantity} -> {adjusted_min_quantity}")
+                            quantity = adjusted_min_quantity
+                            notional_value = quantity * master_trade.price
+                            logger.info(f"✅ New order value: ${notional_value:.2f}")
+                        else:
+                            logger.warning(f"⚠️ Cannot adjust quantity high enough to meet minimum notional")
+                            logger.warning(f"⚠️ Skipping this trade (too small)")
+                            return False
+                    except Exception as adjust_error:
+                        logger.warning(f"⚠️ Failed to adjust quantity for minimum notional: {adjust_error}")
+                        logger.warning(f"⚠️ Skipping this trade (too small)")
+                        return False
+                else:
+                    logger.warning(f"⚠️ Cannot validate notional value (price is 0), proceeding with caution")
+            
             # Validate trade parameters before placing order
             logger.info(f"🎯 Placing follower order: {master_trade.symbol} {master_trade.side} {quantity} ({master_trade.order_type})")
+            if notional_value > 0:
+                logger.info(f"💰 Order notional value: ${notional_value:.2f}")
             
             # Place the order based on order type
             if master_trade.order_type == "MARKET":
@@ -696,7 +731,7 @@ class CopyTradingEngine:
                 )
             else:
                 logger.warning(f"Unsupported order type: {master_trade.order_type}")
-                return
+                return False
             
             logger.info(f"✅ Follower order placed successfully: Order ID {order.get('orderId', 'Unknown')}")
             
@@ -730,6 +765,7 @@ class CopyTradingEngine:
             session.commit()
             
             logger.info(f"Successfully copied trade to follower {config.follower_account_id}")
+            return True
             
         except Exception as e:
             error_msg = str(e)
@@ -754,10 +790,20 @@ class CopyTradingEngine:
                 logger.error(f"🔧 The quantity precision fix should prevent this error")
                 logger.error(f"💡 If you still see this error, please restart the copy trading service")
                 logger.error(f"📊 Problem quantity was: {quantity}")
+            elif "code=-4164" in error_msg:
+                notional_value = quantity * master_trade.price if master_trade.price else 0
+                logger.error("❌ NOTIONAL VALUE TOO SMALL!")
+                logger.error(f"📊 Order value: ${notional_value:.2f} (minimum required: $5)")
+                logger.error(f"📊 Quantity: {quantity}, Price: {master_trade.price}")
+                logger.error(f"💡 Solution: Increase the quantity or skip small orders")
+                logger.warning(f"⚠️ Skipping this trade due to minimum notional requirement")
+                # Don't rollback the session for this error - it's expected for small orders
+                return False
             else:
                 logger.error(f"❌ Unhandled error: {error_msg}")
             
             session.rollback()
+            return False
     
     async def get_engine_status(self) -> Dict:
         """Get the current status of the copy trading engine"""
