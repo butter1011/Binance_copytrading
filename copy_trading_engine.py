@@ -44,6 +44,30 @@ class CopyTradingEngine:
             logger.error(f"Failed to initialize copy trading engine: {e}")
             return False
     
+    def add_system_log(self, level: str, message: str, account_id: int = None, trade_id: int = None):
+        """Add a system log entry to database with fallback to file logging"""
+        try:
+            session = get_session()
+            log = SystemLog(
+                level=level.upper(),
+                message=message,
+                account_id=account_id,
+                trade_id=trade_id
+            )
+            session.add(log)
+            session.commit()
+            session.close()
+            
+            # Also log to file logger for immediate visibility
+            log_func = getattr(logger, level.lower(), logger.info)
+            log_func(f"[DB_LOG] {message}")
+            
+        except Exception as e:
+            logger.error(f"Failed to add system log to database: {e}")
+            # Log to file as fallback
+            log_func = getattr(logger, level.lower(), logger.info)
+            log_func(f"[FALLBACK] {message}")
+    
     async def load_accounts(self):
         """Load all accounts from database"""
         try:
@@ -403,6 +427,9 @@ class CopyTradingEngine:
             session = get_session()
             logger.info(f"💾 Database session created successfully")
             
+            # Log master trade detection
+            self.add_system_log("INFO", f"🔍 Master trade detected: {order.get('symbol')} {order.get('side')} {executed_qty} (Status: {order_status})", master_id)
+            
             # Determine the status and quantity to record
             if order_status == 'NEW':
                 db_status = 'PENDING'
@@ -550,13 +577,20 @@ class CopyTradingEngine:
                 # Place the trade on follower account
                 try:
                     logger.info(f"🚀 About to place follower trade: {master_trade.symbol} {master_trade.side} {follower_quantity}")
+                    # Add detailed log before attempting trade
+                    self.add_system_log("INFO", f"Attempting to copy trade: {master_trade.symbol} {master_trade.side} Qty: {follower_quantity} to follower {config.follower_account_id}", config.follower_account_id)
+                    
                     success = await self.place_follower_trade(master_trade, config, follower_quantity, session)
                     if success:
                         logger.info(f"✅ Successfully placed follower trade for account {config.follower_account_id}")
+                        self.add_system_log("INFO", f"✅ Successfully placed follower trade: {master_trade.symbol} {master_trade.side} Qty: {follower_quantity}", config.follower_account_id)
                     else:
                         logger.warning(f"⚠️ Follower trade was skipped for account {config.follower_account_id} (likely due to minimum notional or other validation)")
+                        self.add_system_log("WARNING", f"⚠️ Follower trade skipped: {master_trade.symbol} (minimum notional or validation issue)", config.follower_account_id)
                 except Exception as follower_error:
-                    logger.error(f"❌ FAILED TO PLACE FOLLOWER TRADE for account {config.follower_account_id}: {follower_error}")
+                    error_msg = f"❌ FAILED TO PLACE FOLLOWER TRADE for account {config.follower_account_id}: {follower_error}"
+                    logger.error(error_msg)
+                    self.add_system_log("ERROR", error_msg, config.follower_account_id)
                     import traceback
                     logger.error(f"Full error traceback: {traceback.format_exc()}")
                     # Continue with other followers instead of stopping completely
@@ -571,18 +605,8 @@ class CopyTradingEngine:
             session.rollback()
     
     async def calculate_follower_quantity(self, master_trade: Trade, config: CopyTradingConfig, follower_client: BinanceClient) -> float:
-        """Calculate the quantity for follower trade based on risk management"""
+        """Calculate the quantity for follower trade based on copy percentage (simplified)"""
         try:
-            # Get follower account balance (handle subaccount limitations)
-            follower_balance = await follower_client.get_balance()
-            
-            # For subaccounts with limited permissions, use a default balance if balance retrieval fails
-            if follower_balance <= 0:
-                logger.warning(f"⚠️ Could not get balance for follower account, using master trade quantity")
-                # Use the same quantity as master trade (1:1 copy)
-                return master_trade.quantity * (config.copy_percentage / 100.0)
-            
-            # Calculate risk amount based on follower's risk percentage
             session = get_session()
             follower_account = session.query(Account).filter(Account.id == config.follower_account_id).first()
             session.close()
@@ -591,23 +615,39 @@ class CopyTradingEngine:
                 logger.error(f"❌ Follower account {config.follower_account_id} not found in database")
                 return 0
             
-            risk_amount = follower_balance * (follower_account.risk_percentage / 100.0)
-            risk_amount *= config.risk_multiplier
+            # SIMPLIFIED APPROACH: Use master quantity with copy percentage
+            # This provides 1:1 copying with percentage scaling, which is more predictable
+            base_quantity = master_trade.quantity * (config.copy_percentage / 100.0)
             
-            # Calculate position size
+            # Log the calculation for transparency
+            logger.info(f"📊 Simple copy calculation: Master {master_trade.quantity} * Copy% {config.copy_percentage}% = {base_quantity}")
+            
+            # Optional: Apply risk multiplier if user wants additional scaling
+            if config.risk_multiplier != 1.0:
+                base_quantity *= config.risk_multiplier
+                logger.info(f"📊 After risk multiplier {config.risk_multiplier}: {base_quantity}")
+            
+            # Get follower account balance for minimum safety check
             try:
-                quantity = await follower_client.calculate_position_size(
-                    master_trade.symbol,
-                    risk_amount,
-                    follower_account.leverage
-                )
-            except Exception as calc_error:
-                logger.warning(f"⚠️ Position size calculation failed for subaccount: {calc_error}")
-                # Fallback: Use master quantity scaled by copy percentage
-                quantity = master_trade.quantity
+                follower_balance = await follower_client.get_balance()
+                if follower_balance > 0:
+                    # Safety check: ensure the position doesn't exceed reasonable limits
+                    # Calculate approximate notional value
+                    mark_price = await follower_client.get_mark_price(master_trade.symbol)
+                    notional_value = base_quantity * mark_price
+                    max_safe_notional = follower_balance * 0.8  # Use max 80% of balance
+                    
+                    if notional_value > max_safe_notional:
+                        safety_quantity = (max_safe_notional / mark_price) * 0.9  # 90% of safe limit
+                        logger.warning(f"⚠️ Position size {base_quantity} too large for balance. Reducing to {safety_quantity}")
+                        base_quantity = safety_quantity
+                else:
+                    logger.warning(f"⚠️ Could not get follower balance for safety check")
+            except Exception as balance_error:
+                logger.warning(f"⚠️ Balance safety check failed: {balance_error}")
+                # Continue with calculated quantity
             
-            # Apply copy percentage
-            quantity *= (config.copy_percentage / 100.0)
+            quantity = base_quantity
             
             # Fix floating point precision issues by rounding to a reasonable number of decimal places
             # Most crypto futures have precision of 0.1, 0.01, 0.001, etc.
@@ -754,15 +794,19 @@ class CopyTradingEngine:
             session.add(follower_trade)
             session.commit()
             
-            # Log the copy trade
+            # Log the copy trade with more details
+            success_message = f"✅ Successfully copied trade: {master_trade.symbol} {master_trade.side} - Master: {master_trade.quantity}, Follower: {follower_trade.quantity} (Copy%: {config.copy_percentage}%)"
             log = SystemLog(
                 level="INFO",
-                message=f"Copied trade {master_trade.id} to follower {config.follower_account_id}",
+                message=success_message,
                 account_id=config.follower_account_id,
                 trade_id=follower_trade.id
             )
             session.add(log)
             session.commit()
+            
+            # Also use our centralized logging function
+            self.add_system_log("INFO", f"Trade copied: {master_trade.symbol} {master_trade.side} - Master: {master_trade.quantity}, Follower: {follower_trade.quantity}", config.follower_account_id, follower_trade.id)
             
             logger.info(f"Successfully copied trade to follower {config.follower_account_id}")
             return True
