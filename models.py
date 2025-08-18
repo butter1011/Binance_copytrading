@@ -37,15 +37,43 @@ class Trade(Base):
     price = Column(Float, nullable=True)
     stop_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
-    status = Column(String, default="PENDING")  # PENDING, FILLED, CANCELLED, REJECTED
+    status = Column(String, default="PENDING")  # PENDING, FILLED, CANCELLED, REJECTED, EXPIRED
     binance_order_id = Column(String, nullable=True)
     copied_from_master = Column(Boolean, default=False)
     master_trade_id = Column(Integer, nullable=True)
+    follower_order_ids = Column(Text, nullable=True)  # JSON string of follower account_id -> order_id mapping
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Relationships
     account = relationship("Account", back_populates="trades")
+    
+    def get_follower_order_ids(self):
+        """Get follower order IDs as a dictionary"""
+        if not self.follower_order_ids:
+            return {}
+        try:
+            return json.loads(self.follower_order_ids)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    
+    def set_follower_order_ids(self, order_mapping):
+        """Set follower order IDs from a dictionary"""
+        if order_mapping:
+            self.follower_order_ids = json.dumps(order_mapping)
+        else:
+            self.follower_order_ids = None
+    
+    def add_follower_order(self, follower_account_id, order_id):
+        """Add a follower order ID"""
+        current_mapping = self.get_follower_order_ids()
+        current_mapping[str(follower_account_id)] = str(order_id)
+        self.set_follower_order_ids(current_mapping)
+    
+    def get_follower_order_id(self, follower_account_id):
+        """Get follower order ID for a specific account"""
+        mapping = self.get_follower_order_ids()
+        return mapping.get(str(follower_account_id))
 
 class Position(Base):
     __tablename__ = "positions"

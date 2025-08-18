@@ -352,16 +352,23 @@ class CopyTradingEngine:
                 # Include orders if:
                 # 1. They are open orders (NEW/PARTIALLY_FILLED) - regardless of time
                 # 2. They are recent filled orders (within time range)
+                # 3. They are recent cancelled/expired orders (need to cancel followers)
                 is_open_order = order_status in ['NEW', 'PARTIALLY_FILLED']
                 is_recent_filled = order_status == 'FILLED' and order_time >= start_time
+                is_recent_cancelled = order_status in ['CANCELED', 'EXPIRED', 'REJECTED'] and order_time >= start_time
                 
                 if (order_id not in seen_orders and 
                     order['side'] in ['BUY', 'SELL'] and 
-                    order_status in ['NEW', 'PARTIALLY_FILLED', 'FILLED'] and
-                    (is_open_order or is_recent_filled)):
+                    order_status in ['NEW', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'] and
+                    (is_open_order or is_recent_filled or is_recent_cancelled)):
                     seen_orders.add(order_id)
                     relevant_orders.append(order)
-                    status_note = "📋 OPEN" if is_open_order else "🏁 RECENT"
+                    if is_open_order:
+                        status_note = "📋 OPEN"
+                    elif is_recent_cancelled:
+                        status_note = "❌ CANCELLED"
+                    else:
+                        status_note = "🏁 RECENT"
                     # Fix timestamp display for logging
                     timestamp_display = datetime.fromtimestamp(order_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
                     logger.info(f"🎯 Found order {status_note}: {order['symbol']} {order['side']} {order['origQty']} - Status: {order_status} - Time: {timestamp_display}")
@@ -491,6 +498,12 @@ class CopyTradingEngine:
                 db_status = 'FILLED'
                 quantity_to_record = executed_qty
                 price_to_record = float(order.get('avgPrice', order.get('price', 0)))
+            elif order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
+                # Handle cancelled/expired orders - need to cancel follower orders
+                logger.info(f"🚫 Processing cancelled/expired order: {order_id}")
+                await self.handle_master_order_cancellation(master_id, order_id, session)
+                session.close()
+                return
             else:
                 logger.warning(f"⚠️ Unsupported order status: {order_status}")
                 session.close()
@@ -520,7 +533,15 @@ class CopyTradingEngine:
             # This ensures followers trade simultaneously with master, not after completion
             if order_status in ['NEW', 'FILLED']:
                 logger.info(f"🚀 Copying {order_status.lower()} order to followers immediately")
-                await self.copy_trade_to_followers(db_trade, session)
+                
+                # Check if this is a position closing order (reduceOnly = True or opposite direction trade)
+                if await self.is_position_closing_order(master_id, db_trade, session):
+                    logger.info(f"🔄 Detected position closing order - closing follower positions")
+                    await self.close_follower_positions(db_trade, session)
+                else:
+                    logger.info(f"📈 Regular trade order - copying to followers")
+                    await self.copy_trade_to_followers(db_trade, session)
+                    
             elif order_status == 'PARTIALLY_FILLED':
                 # For partially filled orders, check if we already copied this order
                 # to avoid duplicate trades
@@ -532,7 +553,14 @@ class CopyTradingEngine:
                 
                 if not existing_copy:
                     logger.info(f"🚀 Copying partially filled order to followers")
-                    await self.copy_trade_to_followers(db_trade, session)
+                    
+                    # Check if this is a position closing order
+                    if await self.is_position_closing_order(master_id, db_trade, session):
+                        logger.info(f"🔄 Detected position closing order - closing follower positions")
+                        await self.close_follower_positions(db_trade, session)
+                    else:
+                        logger.info(f"📈 Regular trade order - copying to followers")
+                        await self.copy_trade_to_followers(db_trade, session)
                 else:
                     logger.info(f"📝 Order already copied, skipping duplicate")
             else:
@@ -934,6 +962,254 @@ class CopyTradingEngine:
                 
         except Exception as e:
             logger.error(f"Error adding account: {e}")
+    
+    async def is_position_closing_order(self, master_id: int, trade: Trade, session: Session) -> bool:
+        """Determine if this trade is closing an existing position"""
+        try:
+            # Get master account client to check positions
+            master_client = self.master_clients.get(master_id)
+            if not master_client:
+                logger.warning(f"⚠️ Master client not found for position check: {master_id}")
+                return False
+            
+            # Get current positions from Binance API
+            positions = await master_client.get_positions()
+            
+            # Check if there's an existing position in the opposite direction
+            for position in positions:
+                if position['symbol'] == trade.symbol:
+                    # If we have a LONG position and the trade is SELL, it's closing
+                    # If we have a SHORT position and the trade is BUY, it's closing
+                    if (position['side'] == 'LONG' and trade.side == 'SELL') or \
+                       (position['side'] == 'SHORT' and trade.side == 'BUY'):
+                        logger.info(f"🔄 Position closing detected: {trade.symbol} {position['side']} position, {trade.side} order")
+                        return True
+            
+            # Also check database for recent opposite trades that might have created positions
+            recent_trades = session.query(Trade).filter(
+                Trade.account_id == master_id,
+                Trade.symbol == trade.symbol,
+                Trade.status == 'FILLED',
+                Trade.created_at >= datetime.utcnow() - timedelta(hours=24)  # Last 24 hours
+            ).order_by(Trade.created_at.desc()).limit(10).all()
+            
+            # Simple heuristic: if the most recent trades were in opposite direction, this might be closing
+            opposite_side = 'BUY' if trade.side == 'SELL' else 'SELL'
+            recent_opposite_trades = [t for t in recent_trades if t.side == opposite_side]
+            
+            if recent_opposite_trades:
+                total_opposite_qty = sum(t.quantity for t in recent_opposite_trades)
+                same_side_trades = [t for t in recent_trades if t.side == trade.side]
+                total_same_qty = sum(t.quantity for t in same_side_trades)
+                
+                # If we have more quantity in opposite direction, this trade is likely closing
+                if total_opposite_qty > total_same_qty:
+                    logger.info(f"🔄 Position closing heuristic: recent opposite trades {total_opposite_qty} > same side {total_same_qty}")
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error checking if order is position closing: {e}")
+            return False  # Default to regular trade copying
+    
+    async def close_follower_positions(self, master_trade: Trade, session: Session):
+        """Close corresponding positions in follower accounts"""
+        try:
+            logger.info(f"🔄 Closing follower positions for master trade: {master_trade.symbol} {master_trade.side}")
+            
+            # Get copy trading configurations for this master
+            configs = session.query(CopyTradingConfig).filter(
+                CopyTradingConfig.master_account_id == master_trade.account_id,
+                CopyTradingConfig.is_active == True
+            ).all()
+            
+            if not configs:
+                logger.warning(f"⚠️ No copy trading configurations found for position closing")
+                return
+            
+            logger.info(f"📋 Found {len(configs)} follower accounts to close positions")
+            
+            closed_count = 0
+            for config in configs:
+                try:
+                    follower_client = self.follower_clients.get(config.follower_account_id)
+                    if not follower_client:
+                        logger.error(f"❌ Follower client not found for account {config.follower_account_id}")
+                        continue
+                    
+                    # Get follower positions
+                    follower_positions = await follower_client.get_positions()
+                    position_to_close = None
+                    
+                    # Find the position that corresponds to what the master is closing
+                    for pos in follower_positions:
+                        if pos['symbol'] == master_trade.symbol:
+                            # Master is selling (closing long) -> close follower's long position
+                            # Master is buying (closing short) -> close follower's short position
+                            if (master_trade.side == 'SELL' and pos['side'] == 'LONG') or \
+                               (master_trade.side == 'BUY' and pos['side'] == 'SHORT'):
+                                position_to_close = pos
+                                break
+                    
+                    if position_to_close:
+                        # Calculate quantity to close (proportional to copy percentage)
+                        close_quantity = position_to_close['size'] * (config.copy_percentage / 100.0)
+                        close_quantity = round(close_quantity, 8)  # Fix precision
+                        
+                        logger.info(f"🔄 Closing follower position: {config.follower_account_id} {master_trade.symbol} {position_to_close['side']} {close_quantity}")
+                        
+                        # Close the position
+                        close_order = await follower_client.close_position(
+                            master_trade.symbol, 
+                            position_to_close['side'], 
+                            close_quantity
+                        )
+                        
+                        if close_order:
+                            # Record the position close as a trade
+                            close_side = 'SELL' if position_to_close['side'] == 'LONG' else 'BUY'
+                            follower_trade = Trade(
+                                account_id=config.follower_account_id,
+                                symbol=master_trade.symbol,
+                                side=close_side,
+                                order_type='MARKET',
+                                quantity=close_quantity,
+                                price=0,  # Market order, price determined by market
+                                status='FILLED',
+                                binance_order_id=close_order.get('orderId'),
+                                copied_from_master=True,
+                                master_trade_id=master_trade.id
+                            )
+                            
+                            session.add(follower_trade)
+                            session.commit()
+                            closed_count += 1
+                            
+                            logger.info(f"✅ Closed follower position: {config.follower_account_id} {master_trade.symbol}")
+                            self.add_system_log("INFO", f"🔄 Position closed: {master_trade.symbol} {position_to_close['side']} {close_quantity} (master position closing)", config.follower_account_id, follower_trade.id)
+                        else:
+                            logger.warning(f"⚠️ Failed to close position for follower {config.follower_account_id}")
+                    else:
+                        logger.info(f"ℹ️ No corresponding position found to close for follower {config.follower_account_id}")
+                        
+                except Exception as follower_error:
+                    logger.error(f"❌ Error closing position for follower {config.follower_account_id}: {follower_error}")
+                    self.add_system_log("ERROR", f"❌ Error closing position: {follower_error}", config.follower_account_id)
+            
+            if closed_count > 0:
+                logger.info(f"✅ Successfully closed positions for {closed_count}/{len(configs)} followers")
+                self.add_system_log("INFO", f"🔄 Master position closing - {closed_count} follower positions closed", master_trade.account_id, master_trade.id)
+            else:
+                logger.warning(f"⚠️ No follower positions were closed for master position closing")
+                
+            # Mark master trade as copied
+            master_trade.copied_from_master = True
+            session.commit()
+            
+        except Exception as e:
+            logger.error(f"❌ Error closing follower positions: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            session.rollback()
+    
+    async def handle_master_order_cancellation(self, master_id: int, master_order_id: str, session: Session):
+        """Handle cancellation of master orders by cancelling corresponding follower orders"""
+        try:
+            logger.info(f"🚫 Handling master order cancellation: {master_order_id}")
+            
+            # Find the master trade record
+            master_trade = session.query(Trade).filter(
+                Trade.account_id == master_id,
+                Trade.binance_order_id == str(master_order_id)
+            ).first()
+            
+            if not master_trade:
+                logger.warning(f"⚠️ Master trade not found for cancelled order {master_order_id}")
+                return
+            
+            # Update master trade status
+            master_trade.status = 'CANCELLED'
+            session.commit()
+            
+            logger.info(f"📝 Updated master trade {master_trade.id} status to CANCELLED")
+            
+            # Find all follower trades that were copied from this master trade
+            follower_trades = session.query(Trade).filter(
+                Trade.master_trade_id == master_trade.id,
+                Trade.copied_from_master == True,
+                Trade.status.in_(['PENDING', 'PARTIALLY_FILLED'])  # Only cancel active orders
+            ).all()
+            
+            if not follower_trades:
+                logger.info(f"ℹ️ No active follower trades found for cancelled master order {master_order_id}")
+                return
+            
+            logger.info(f"🔍 Found {len(follower_trades)} follower trades to cancel")
+            
+            # Cancel each follower trade
+            cancelled_count = 0
+            for follower_trade in follower_trades:
+                try:
+                    follower_client = self.follower_clients.get(follower_trade.account_id)
+                    if not follower_client:
+                        logger.error(f"❌ Follower client not found for account {follower_trade.account_id}")
+                        continue
+                    
+                    if follower_trade.binance_order_id:
+                        # Determine order type for enhanced logging
+                        order_type_desc = "order"
+                        if follower_trade.order_type == "STOP_MARKET":
+                            order_type_desc = "stop-loss order"
+                        elif follower_trade.order_type == "TAKE_PROFIT_MARKET":
+                            order_type_desc = "take-profit order"
+                        elif follower_trade.order_type == "LIMIT":
+                            order_type_desc = "limit order"
+                        elif follower_trade.order_type == "MARKET":
+                            order_type_desc = "market order"
+                        
+                        logger.info(f"🚫 Cancelling follower {order_type_desc}: {follower_trade.symbol} {follower_trade.side} for account {follower_trade.account_id}")
+                        
+                        # Cancel the order on Binance
+                        success = await follower_client.cancel_order(
+                            follower_trade.symbol, 
+                            str(follower_trade.binance_order_id)
+                        )
+                        
+                        if success:
+                            # Update follower trade status
+                            follower_trade.status = 'CANCELLED'
+                            session.commit()
+                            cancelled_count += 1
+                            
+                            logger.info(f"✅ Cancelled follower {order_type_desc} {follower_trade.binance_order_id} for account {follower_trade.account_id}")
+                            
+                            # Enhanced logging for different order types
+                            if follower_trade.order_type in ["STOP_MARKET", "TAKE_PROFIT_MARKET"]:
+                                self.add_system_log("INFO", f"🚫 Cancelled follower {order_type_desc}: {follower_trade.symbol} (master {order_type_desc} cancelled)", follower_trade.account_id, follower_trade.id)
+                            else:
+                                self.add_system_log("INFO", f"🚫 Cancelled follower {order_type_desc}: {follower_trade.symbol} (master order cancelled)", follower_trade.account_id, follower_trade.id)
+                        else:
+                            logger.error(f"❌ Failed to cancel follower {order_type_desc} {follower_trade.binance_order_id} for account {follower_trade.account_id}")
+                            self.add_system_log("ERROR", f"❌ Failed to cancel follower {order_type_desc}: {follower_trade.symbol}", follower_trade.account_id, follower_trade.id)
+                    else:
+                        logger.warning(f"⚠️ No Binance order ID found for follower trade {follower_trade.id}")
+                        
+                except Exception as cancel_error:
+                    logger.error(f"❌ Error cancelling follower trade {follower_trade.id}: {cancel_error}")
+                    self.add_system_log("ERROR", f"❌ Error cancelling follower order: {cancel_error}", follower_trade.account_id, follower_trade.id)
+            
+            if cancelled_count > 0:
+                logger.info(f"✅ Successfully cancelled {cancelled_count}/{len(follower_trades)} follower orders")
+                self.add_system_log("INFO", f"🚫 Master order cancelled - {cancelled_count} follower orders cancelled", master_id, master_trade.id)
+            else:
+                logger.warning(f"⚠️ No follower orders were successfully cancelled for master order {master_order_id}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error handling master order cancellation: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            session.rollback()
     
     async def remove_account(self, account_id: int):
         """Remove an account from the engine"""

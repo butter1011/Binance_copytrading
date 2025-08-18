@@ -416,6 +416,63 @@ class BinanceClient:
             logger.error(f"Failed to cancel order: {e}")
             return False
     
+    async def close_position(self, symbol: str, side: str = None, quantity: float = None) -> Dict:
+        """Close a position by placing a market order in the opposite direction"""
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            
+            # Get current positions to determine what to close
+            positions = await self.get_positions()
+            position_to_close = None
+            
+            for pos in positions:
+                if pos['symbol'] == symbol:
+                    if side is None or pos['side'] == side:
+                        position_to_close = pos
+                        break
+            
+            if not position_to_close:
+                logger.warning(f"No position found to close for {symbol} {side or 'any side'}")
+                return None
+            
+            # Determine opposite side for closing
+            close_side = 'SELL' if position_to_close['side'] == 'LONG' else 'BUY'
+            close_quantity = quantity if quantity else position_to_close['size']
+            
+            logger.info(f"Closing position: {symbol} {position_to_close['side']} {close_quantity} -> placing {close_side} order")
+            
+            # Check position mode to determine if we need positionSide
+            is_hedge_mode = await self.get_position_mode()
+            
+            order_params = {
+                'symbol': symbol,
+                'side': close_side,
+                'type': 'MARKET',
+                'quantity': close_quantity,
+                'reduceOnly': True  # This ensures we're closing, not opening new positions
+            }
+            
+            # For hedge mode, specify position side
+            if is_hedge_mode:
+                # Position side is the same as the position we're closing
+                position_side = position_to_close['side']  # LONG or SHORT
+                order_params['positionSide'] = position_side
+                logger.info(f"Hedge mode detected - using positionSide: {position_side}")
+            else:
+                logger.info("One-way mode detected - no positionSide needed")
+            
+            order = await loop.run_in_executor(None, lambda: self.client.futures_create_order(**order_params))
+            logger.info(f"Position closed: {symbol} {close_side} {close_quantity} (reduceOnly)")
+            return order
+            
+        except BinanceOrderException as e:
+            logger.error(f"Position close failed: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error closing position: {e}")
+            raise
+    
     async def get_open_orders(self, symbol: str = None) -> List[Dict]:
         """Get all open orders for a symbol or all symbols"""
         try:
