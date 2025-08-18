@@ -328,6 +328,16 @@ def delete_copy_config(config_id):
         flash("Failed to delete copy trading configuration", "error")
     return redirect(url_for('config'))
 
+@app.route('/api/logs/cleanup', methods=['POST'])
+def cleanup_logs():
+    """Clean up old system logs"""
+    result = post_api_data("/logs/cleanup", {"max_logs_per_level": 500})
+    if result:
+        flash(f"Log cleanup completed: {result.get('cleaned_count', 0)} old logs removed", "success")
+    else:
+        flash("Failed to clean up logs", "error")
+    return redirect(url_for('logs'))
+
 # WebSocket events
 @socketio.on('connect')
 def handle_connect():

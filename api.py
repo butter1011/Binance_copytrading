@@ -612,6 +612,23 @@ async def get_logs(level: Optional[str] = None, limit: int = 100, db = Depends(g
         logger.error(f"Error getting logs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/logs/cleanup")
+async def cleanup_logs(max_logs_per_level: int = 500):
+    """Clean up old system logs to prevent database bloat"""
+    try:
+        from copy_trading_engine import copy_trading_engine
+        
+        cleaned_count = copy_trading_engine.cleanup_old_logs(max_logs_per_level)
+        
+        return {
+            "message": f"Successfully cleaned up {cleaned_count} old logs",
+            "cleaned_count": cleaned_count,
+            "max_logs_per_level": max_logs_per_level
+        }
+    except Exception as e:
+        logger.error(f"Error cleaning up logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Account balance and positions
 @app.get("/accounts/{account_id}/balance")
 async def get_account_balance(account_id: int, db = Depends(get_db)):

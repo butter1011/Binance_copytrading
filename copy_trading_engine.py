@@ -52,6 +52,24 @@ class CopyTradingEngine:
         """Add a system log entry to database with fallback to file logging"""
         try:
             session = get_session()
+            
+            # Cleanup old logs periodically to prevent massive log accumulation
+            # Keep only last 1000 logs per level to prevent database bloat
+            try:
+                log_count = session.query(SystemLog).filter(SystemLog.level == level.upper()).count()
+                if log_count > 1000:
+                    # Remove oldest logs of this level, keeping only the most recent 500
+                    oldest_logs = session.query(SystemLog).filter(
+                        SystemLog.level == level.upper()
+                    ).order_by(SystemLog.created_at.asc()).limit(log_count - 500).all()
+                    
+                    for old_log in oldest_logs:
+                        session.delete(old_log)
+                    
+                    logger.info(f"🧹 Cleaned up {len(oldest_logs)} old {level} logs")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️ Log cleanup failed: {cleanup_error}")
+            
             log = SystemLog(
                 level=level.upper(),
                 message=message,
@@ -71,6 +89,44 @@ class CopyTradingEngine:
             # Log to file as fallback
             log_func = getattr(logger, level.lower(), logger.info)
             log_func(f"[FALLBACK] {message}")
+    
+    def cleanup_old_logs(self, max_logs_per_level: int = 500):
+        """Clean up old system logs to prevent database bloat"""
+        try:
+            session = get_session()
+            
+            # Get all log levels
+            levels = session.query(SystemLog.level).distinct().all()
+            total_cleaned = 0
+            
+            for (level,) in levels:
+                log_count = session.query(SystemLog).filter(SystemLog.level == level).count()
+                
+                if log_count > max_logs_per_level:
+                    # Remove oldest logs, keeping only the most recent ones
+                    logs_to_remove = log_count - max_logs_per_level
+                    oldest_logs = session.query(SystemLog).filter(
+                        SystemLog.level == level
+                    ).order_by(SystemLog.created_at.asc()).limit(logs_to_remove).all()
+                    
+                    for old_log in oldest_logs:
+                        session.delete(old_log)
+                    
+                    total_cleaned += len(oldest_logs)
+                    logger.info(f"🧹 Cleaned up {len(oldest_logs)} old {level} logs")
+            
+            session.commit()
+            session.close()
+            
+            if total_cleaned > 0:
+                logger.info(f"✅ Total log cleanup: {total_cleaned} old logs removed")
+                self.add_system_log("INFO", f"🧹 Log cleanup completed: {total_cleaned} old logs removed")
+            
+            return total_cleaned
+            
+        except Exception as e:
+            logger.error(f"❌ Error during log cleanup: {e}")
+            return 0
     
     async def initialize_order_tracking(self):
         """Initialize order tracking to prevent duplicates on restart"""
@@ -352,14 +408,16 @@ class CopyTradingEngine:
                 # Include orders if:
                 # 1. They are open orders (NEW/PARTIALLY_FILLED) - regardless of time
                 # 2. They are recent filled orders (within time range)
-                # 3. They are recent cancelled/expired orders (need to cancel followers)
+                # 3. They are recent cancelled/expired orders (need to cancel followers) - but only very recent ones
                 is_open_order = order_status in ['NEW', 'PARTIALLY_FILLED']
                 is_recent_filled = order_status == 'FILLED' and order_time >= start_time
-                is_recent_cancelled = order_status in ['CANCELED', 'EXPIRED', 'REJECTED'] and order_time >= start_time
+                # For cancelled orders, only process very recent ones (last 5 minutes) to avoid repetitive processing
+                recent_cancelled_threshold = int((datetime.utcnow() - timedelta(minutes=5)).timestamp() * 1000)
+                is_recent_cancelled = order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and order_time >= recent_cancelled_threshold
                 
                 if (order_id not in seen_orders and 
                     order['side'] in ['BUY', 'SELL'] and 
-                    order_status in ['NEW', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'] and
+                    order_status in ['NEW', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and
                     (is_open_order or is_recent_filled or is_recent_cancelled)):
                     seen_orders.add(order_id)
                     relevant_orders.append(order)
@@ -501,7 +559,26 @@ class CopyTradingEngine:
             elif order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
                 # Handle cancelled/expired orders - need to cancel follower orders
                 logger.info(f"🚫 Processing cancelled/expired order: {order_id}")
-                await self.handle_master_order_cancellation(master_id, order_id, session)
+                
+                # First, try to find existing master trade record for this order
+                existing_master_trade = session.query(Trade).filter(
+                    Trade.account_id == master_id,
+                    Trade.binance_order_id == str(order_id)
+                ).first()
+                
+                if existing_master_trade:
+                    logger.info(f"📝 Found existing master trade {existing_master_trade.id} for cancelled order")
+                    # Update the existing trade status
+                    existing_master_trade.status = 'CANCELLED'
+                    session.commit()
+                    # Handle follower cancellations using the existing trade
+                    await self.handle_master_order_cancellation_with_trade(existing_master_trade, session)
+                else:
+                    logger.info(f"📝 No existing master trade found for cancelled order {order_id}")
+                    # This might be an order that was cancelled before it was copied
+                    # Still log it to prevent reprocessing
+                    self.add_system_log("INFO", f"🚫 Master order cancelled (not copied): {order.get('symbol')} {order.get('side')} {order_id}", master_id)
+                
                 session.close()
                 return
             else:
@@ -1113,26 +1190,10 @@ class CopyTradingEngine:
             logger.error(f"Full traceback: {traceback.format_exc()}")
             session.rollback()
     
-    async def handle_master_order_cancellation(self, master_id: int, master_order_id: str, session: Session):
-        """Handle cancellation of master orders by cancelling corresponding follower orders"""
+    async def handle_master_order_cancellation_with_trade(self, master_trade: Trade, session: Session):
+        """Handle cancellation of master orders using existing trade record"""
         try:
-            logger.info(f"🚫 Handling master order cancellation: {master_order_id}")
-            
-            # Find the master trade record
-            master_trade = session.query(Trade).filter(
-                Trade.account_id == master_id,
-                Trade.binance_order_id == str(master_order_id)
-            ).first()
-            
-            if not master_trade:
-                logger.warning(f"⚠️ Master trade not found for cancelled order {master_order_id}")
-                return
-            
-            # Update master trade status
-            master_trade.status = 'CANCELLED'
-            session.commit()
-            
-            logger.info(f"📝 Updated master trade {master_trade.id} status to CANCELLED")
+            logger.info(f"🚫 Handling master order cancellation for trade {master_trade.id}")
             
             # Find all follower trades that were copied from this master trade
             follower_trades = session.query(Trade).filter(
@@ -1142,7 +1203,7 @@ class CopyTradingEngine:
             ).all()
             
             if not follower_trades:
-                logger.info(f"ℹ️ No active follower trades found for cancelled master order {master_order_id}")
+                logger.info(f"ℹ️ No active follower trades found for cancelled master trade {master_trade.id}")
                 return
             
             logger.info(f"🔍 Found {len(follower_trades)} follower trades to cancel")
@@ -1201,12 +1262,82 @@ class CopyTradingEngine:
             
             if cancelled_count > 0:
                 logger.info(f"✅ Successfully cancelled {cancelled_count}/{len(follower_trades)} follower orders")
-                self.add_system_log("INFO", f"🚫 Master order cancelled - {cancelled_count} follower orders cancelled", master_id, master_trade.id)
+                self.add_system_log("INFO", f"🚫 Master order cancelled - {cancelled_count} follower orders cancelled", master_trade.account_id, master_trade.id)
             else:
-                logger.warning(f"⚠️ No follower orders were successfully cancelled for master order {master_order_id}")
+                logger.warning(f"⚠️ No follower orders were successfully cancelled for master trade {master_trade.id}")
                 
         except Exception as e:
+            logger.error(f"❌ Error handling master order cancellation with trade: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            session.rollback()
+
+    async def handle_master_order_cancellation(self, master_id: int, master_order_id: str, session: Session):
+        """Handle cancellation of master orders by cancelling corresponding follower orders (Legacy method)"""
+        try:
+            logger.info(f"🚫 Handling master order cancellation: {master_order_id}")
+            
+            # Find the master trade record
+            master_trade = session.query(Trade).filter(
+                Trade.account_id == master_id,
+                Trade.binance_order_id == str(master_order_id)
+            ).first()
+            
+            if not master_trade:
+                logger.warning(f"⚠️ Master trade not found for cancelled order {master_order_id}")
+                return
+            
+            # Update master trade status
+            master_trade.status = 'CANCELLED'
+            session.commit()
+            
+            logger.info(f"📝 Updated master trade {master_trade.id} status to CANCELLED")
+            
+            # Use the new method with the trade record
+            await self.handle_master_order_cancellation_with_trade(master_trade, session)
+            
+        except Exception as e:
             logger.error(f"❌ Error handling master order cancellation: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            session.rollback()
+    
+    async def handle_position_closing(self, master_id: int, order: dict, session: Session):
+        """Handle position closing orders (market orders that close existing positions)"""
+        try:
+            order_id = str(order['orderId'])
+            logger.info(f"🔄 Handling position closing order: {order_id}")
+            
+            # Create a temporary trade object to use existing closing logic
+            temp_trade = Trade(
+                account_id=master_id,
+                symbol=order['symbol'],
+                side=order['side'],
+                order_type=order['type'],
+                quantity=float(order.get('executedQty', order.get('origQty', 0))),
+                price=float(order.get('avgPrice', order.get('price', 0))),
+                status='FILLED',
+                binance_order_id=str(order['orderId']),
+                copied_from_master=False
+            )
+            
+            # Add to database
+            session.add(temp_trade)
+            session.commit()
+            session.refresh(temp_trade)
+            
+            logger.info(f"✅ Created trade record {temp_trade.id} for position closing")
+            
+            # Check if this is a position closing order and close follower positions
+            if await self.is_position_closing_order(master_id, temp_trade, session):
+                logger.info(f"🔄 Confirmed position closing - closing follower positions")
+                await self.close_follower_positions(temp_trade, session)
+            else:
+                logger.info(f"📈 Not a position closing order - copying as regular trade")
+                await self.copy_trade_to_followers(temp_trade, session)
+            
+        except Exception as e:
+            logger.error(f"❌ Error handling position closing: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             session.rollback()
