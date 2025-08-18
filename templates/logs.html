@@ -130,6 +130,10 @@
                         <i class="fas fa-download me-2"></i>
                         Export
                     </button>
+                    <button type="button" class="btn btn-outline-warning btn-sm" onclick="cleanupOldLogs()">
+                        <i class="fas fa-broom me-2"></i>
+                        Cleanup Old
+                    </button>
                     <button type="button" class="btn btn-outline-danger btn-sm" onclick="clearLogs()">
                         <i class="fas fa-trash me-2"></i>
                         Clear All
@@ -423,10 +427,37 @@
         alert('Export functionality would be implemented here');
     }
 
+    function cleanupOldLogs() {
+        if (confirm('Clean up old logs? This will keep only the most recent 500 logs per level.')) {
+            // Show loading state
+            const cleanupButton = document.querySelector('button[onclick="cleanupOldLogs()"]');
+            const originalText = cleanupButton.innerHTML;
+            cleanupButton.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Cleaning...';
+            cleanupButton.disabled = true;
+            
+            // Create form and submit to cleanup old logs
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/api/logs/cleanup';
+            document.body.appendChild(form);
+            form.submit();
+        }
+    }
+
     function clearLogs() {
-        if (confirm('Are you sure you want to clear all logs? This action cannot be undone.')) {
-            // This would typically make an API call to clear logs
-            alert('Clear logs functionality would be implemented here');
+        if (confirm('Are you sure you want to clear ALL logs? This action cannot be undone.')) {
+            // Show loading state
+            const clearButton = document.querySelector('button[onclick="clearLogs()"]');
+            const originalText = clearButton.innerHTML;
+            clearButton.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Clearing...';
+            clearButton.disabled = true;
+            
+            // Create form and submit to clear all logs
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/api/logs/clear-all';
+            document.body.appendChild(form);
+            form.submit();
         }
     }
 

@@ -629,6 +629,29 @@ async def cleanup_logs(max_logs_per_level: int = 500):
         logger.error(f"Error cleaning up logs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/logs/clear-all")
+async def clear_all_logs(db = Depends(get_db)):
+    """Clear ALL system logs from the database"""
+    try:
+        # Count logs before deletion
+        total_logs = db.query(SystemLog).count()
+        
+        # Delete all logs
+        db.query(SystemLog).delete()
+        db.commit()
+        
+        logger.info(f"🧹 Cleared all {total_logs} system logs from database")
+        
+        return {
+            "message": f"Successfully cleared all logs",
+            "cleared_count": total_logs,
+            "status": "success"
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error clearing all logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Account balance and positions
 @app.get("/accounts/{account_id}/balance")
 async def get_account_balance(account_id: int, db = Depends(get_db)):

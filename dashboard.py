@@ -338,6 +338,16 @@ def cleanup_logs():
         flash("Failed to clean up logs", "error")
     return redirect(url_for('logs'))
 
+@app.route('/api/logs/clear-all', methods=['POST'])
+def clear_all_logs():
+    """Clear ALL system logs"""
+    result = delete_api_data("/logs/clear-all")
+    if result:
+        flash(f"All logs cleared successfully: {result.get('cleared_count', 0)} logs removed", "success")
+    else:
+        flash("Failed to clear all logs", "error")
+    return redirect(url_for('logs'))
+
 # WebSocket events
 @socketio.on('connect')
 def handle_connect():
