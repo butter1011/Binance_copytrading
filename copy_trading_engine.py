@@ -479,6 +479,7 @@ class CopyTradingEngine:
             order_time = datetime.fromtimestamp(order.get('time', order.get('updateTime', 0)) / 1000)
             
             logger.info(f"🎯 Starting to process master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status} - Time: {order_time}")
+            logger.info(f"🔍 Order details: ID={order_id}, ExecutedQty={executed_qty}, Type={order.get('type', 'UNKNOWN')}")
             
             # Check if this order is from before restart (prevent duplicate processing)
             if master_id in self.last_processed_order_time:
@@ -503,6 +504,13 @@ class CopyTradingEngine:
                     
                     if existing_trade:
                         logger.debug(f"✅ Order {order_id} exists in database, skipping")
+                        # For cancelled orders, still check if we need to handle follower cancellations
+                        if order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and existing_trade.status != 'CANCELLED':
+                            logger.info(f"🔄 Order {order_id} status changed to CANCELLED - handling follower cancellations")
+                            existing_trade.status = 'CANCELLED'
+                            session_check.commit()
+                            await self.handle_master_order_cancellation_with_trade(existing_trade, session_check)
+                            session_check.close()
                         return
                     else:
                         logger.warning(f"🔄 Order {order_id} NOT in database - reprocessing...")
@@ -557,7 +565,7 @@ class CopyTradingEngine:
                 price_to_record = float(order.get('avgPrice', order.get('price', 0)))
             elif order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
                 # Handle cancelled/expired orders - need to cancel follower orders
-                logger.info(f"🚫 Processing cancelled/expired order: {order_id}")
+                logger.info(f"🚫 Processing cancelled/expired order: {order_id} - Symbol: {order.get('symbol')} Side: {order.get('side')} Qty: {order.get('origQty')}")
                 
                 # First, try to find existing master trade record for this order
                 existing_master_trade = session.query(Trade).filter(
@@ -566,22 +574,25 @@ class CopyTradingEngine:
                 ).first()
                 
                 if existing_master_trade:
-                    logger.info(f"📝 Found existing master trade {existing_master_trade.id} for cancelled order")
+                    logger.info(f"📝 Found existing master trade {existing_master_trade.id} for cancelled order - Status: {existing_master_trade.status}")
                     # Update the existing trade status
-                    existing_master_trade.status = 'CANCELLED'
-                    session.commit()
+                    if existing_master_trade.status != 'CANCELLED':
+                        existing_master_trade.status = 'CANCELLED'
+                        session.commit()
+                        logger.info(f"📝 Updated master trade {existing_master_trade.id} status to CANCELLED")
                     # Handle follower cancellations using the existing trade
                     await self.handle_master_order_cancellation_with_trade(existing_master_trade, session)
                 else:
                     logger.info(f"📝 No existing master trade found for cancelled order {order_id}")
                     # Search for follower trades by order symbol, side, and time range
                     # This catches cases where the master order was cancelled before the trade record was created
-                    logger.info(f"🔍 Searching for follower trades by order details: {order.get('symbol')} {order.get('side')}")
+                    logger.info(f"🔍 Searching for follower trades by order details: {order.get('symbol')} {order.get('side')} {order.get('origQty')}")
                     await self.handle_cancellation_by_order_details(master_id, order, session)
                     
                     # Log the cancellation
                     self.add_system_log("INFO", f"🚫 Master order cancelled: {order.get('symbol')} {order.get('side')} {order_id}", master_id)
                 
+                logger.info(f"🔚 Completed processing cancelled order {order_id}")
                 session.close()
                 return
             else:
