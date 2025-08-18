@@ -470,124 +470,124 @@ class BinanceClient:
             logger.error(f"Failed to get mark price: {e}")
             raise
 
-async def calculate_position_size(self, symbol: str, risk_amount: float, leverage: int) -> float:
-    """Calculate position size based on risk amount and leverage"""
-    try:
-        mark_price = await self.get_mark_price(symbol)
-        position_value = risk_amount * leverage
-        quantity = position_value / mark_price
-        
-        # Get symbol info for quantity precision
-        symbol_info = await self.get_symbol_info(symbol)
-        if symbol_info:
-            lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-            if lot_size_filter:
-                step_size = float(lot_size_filter['stepSize'])
-                min_qty = float(lot_size_filter['minQty'])
-                max_qty = float(lot_size_filter['maxQty'])
-                
-                # Round to step size
-                quantity = round(quantity / step_size) * step_size
-                
-                # Ensure within bounds
-                quantity = max(min_qty, min(quantity, max_qty))
-                
-                logger.info(f"📊 Position size calculated: {quantity} (min: {min_qty}, max: {max_qty}, step: {step_size})")
-        
-        return quantity
-    except Exception as e:
-        logger.error(f"Failed to calculate position size: {e}")
-        raise
-
-async def adjust_quantity_precision(self, symbol: str, quantity: float) -> float:
-    """Adjust quantity to match symbol's precision requirements"""
-    try:
-        symbol_info = await self.get_symbol_info(symbol)
-        if symbol_info:
-            lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-            if lot_size_filter:
-                step_size = float(lot_size_filter['stepSize'])
-                min_qty = float(lot_size_filter['minQty'])
-                max_qty = float(lot_size_filter['maxQty'])
-                
-                # Round to step size
-                adjusted_qty = round(quantity / step_size) * step_size
-                
-                # Ensure within bounds
-                adjusted_qty = max(min_qty, min(adjusted_qty, max_qty))
-                
-                if adjusted_qty != quantity:
-                    logger.info(f"📏 Adjusted quantity: {quantity} -> {adjusted_qty}")
-                
-                return adjusted_qty
-        return quantity
-    except Exception as e:
-        logger.warning(f"Failed to adjust quantity precision: {e}")
-        return quantity
-
-async def start_user_socket(self, callback):
-    """Start user data stream using websockets"""
-    try:
-        # Get listen key for user data stream
-        listen_key = self.client.futures_stream_get_listen_key()
-        
-        # Create WebSocket connection
-        ws_url = f"wss://fstream.binance.com/ws/{listen_key}"
-        if self.testnet:
-            ws_url = f"wss://stream.binancefuture.com/ws/{listen_key}"
-        
-        async def websocket_handler():
-            try:
-                async with websockets.connect(ws_url) as websocket:
-                    self.ws_connections['user_data'] = websocket
-                    logger.info("User data stream started")
+    async def calculate_position_size(self, symbol: str, risk_amount: float, leverage: int) -> float:
+        """Calculate position size based on risk amount and leverage"""
+        try:
+            mark_price = await self.get_mark_price(symbol)
+            position_value = risk_amount * leverage
+            quantity = position_value / mark_price
+            
+            # Get symbol info for quantity precision
+            symbol_info = await self.get_symbol_info(symbol)
+            if symbol_info:
+                lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+                if lot_size_filter:
+                    step_size = float(lot_size_filter['stepSize'])
+                    min_qty = float(lot_size_filter['minQty'])
+                    max_qty = float(lot_size_filter['maxQty'])
                     
-                    while True:
-                        try:
-                            message = await websocket.recv()
-                            data = json.loads(message)
-                            await callback(data)
-                        except websockets.exceptions.ConnectionClosed:
-                            logger.warning("WebSocket connection closed, attempting to reconnect...")
-                            break
-                        except Exception as e:
-                            logger.error(f"Error processing WebSocket message: {e}")
-                            
-            except Exception as e:
-                logger.error(f"WebSocket connection error: {e}")
-        
-        # Start WebSocket task
-        task = asyncio.create_task(websocket_handler())
-        self.ws_tasks['user_data'] = task
-        return task
-        
-    except Exception as e:
-        logger.error(f"Failed to start user socket: {e}")
-        raise
-
-async def stop_user_socket(self):
-    """Stop user data stream"""
-    try:
-        if 'user_data' in self.ws_tasks:
-            task = self.ws_tasks['user_data']
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            del self.ws_tasks['user_data']
+                    # Round to step size
+                    quantity = round(quantity / step_size) * step_size
+                    
+                    # Ensure within bounds
+                    quantity = max(min_qty, min(quantity, max_qty))
+                    
+                    logger.info(f"📊 Position size calculated: {quantity} (min: {min_qty}, max: {max_qty}, step: {step_size})")
             
-        if 'user_data' in self.ws_connections:
-            websocket = self.ws_connections['user_data']
-            await websocket.close()
-            del self.ws_connections['user_data']
+            return quantity
+        except Exception as e:
+            logger.error(f"Failed to calculate position size: {e}")
+            raise
+
+    async def adjust_quantity_precision(self, symbol: str, quantity: float) -> float:
+        """Adjust quantity to match symbol's precision requirements"""
+        try:
+            symbol_info = await self.get_symbol_info(symbol)
+            if symbol_info:
+                lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+                if lot_size_filter:
+                    step_size = float(lot_size_filter['stepSize'])
+                    min_qty = float(lot_size_filter['minQty'])
+                    max_qty = float(lot_size_filter['maxQty'])
+                    
+                    # Round to step size
+                    adjusted_qty = round(quantity / step_size) * step_size
+                    
+                    # Ensure within bounds
+                    adjusted_qty = max(min_qty, min(adjusted_qty, max_qty))
+                    
+                    if adjusted_qty != quantity:
+                        logger.info(f"📏 Adjusted quantity: {quantity} -> {adjusted_qty}")
+                    
+                    return adjusted_qty
+            return quantity
+        except Exception as e:
+            logger.warning(f"Failed to adjust quantity precision: {e}")
+            return quantity
+
+    async def start_user_socket(self, callback):
+        """Start user data stream using websockets"""
+        try:
+            # Get listen key for user data stream
+            listen_key = self.client.futures_stream_get_listen_key()
             
-        logger.info("User data stream stopped")
-    except Exception as e:
-        logger.error(f"Failed to stop user socket: {e}")
+            # Create WebSocket connection
+            ws_url = f"wss://fstream.binance.com/ws/{listen_key}"
+            if self.testnet:
+                ws_url = f"wss://stream.binancefuture.com/ws/{listen_key}"
+            
+            async def websocket_handler():
+                try:
+                    async with websockets.connect(ws_url) as websocket:
+                        self.ws_connections['user_data'] = websocket
+                        logger.info("User data stream started")
+                        
+                        while True:
+                            try:
+                                message = await websocket.recv()
+                                data = json.loads(message)
+                                await callback(data)
+                            except websockets.exceptions.ConnectionClosed:
+                                logger.warning("WebSocket connection closed, attempting to reconnect...")
+                                break
+                            except Exception as e:
+                                logger.error(f"Error processing WebSocket message: {e}")
+                                
+                except Exception as e:
+                    logger.error(f"WebSocket connection error: {e}")
+            
+            # Start WebSocket task
+            task = asyncio.create_task(websocket_handler())
+            self.ws_tasks['user_data'] = task
+            return task
+            
+        except Exception as e:
+            logger.error(f"Failed to start user socket: {e}")
+            raise
 
-async def __aenter__(self):
-    return self
+    async def stop_user_socket(self):
+        """Stop user data stream"""
+        try:
+            if 'user_data' in self.ws_tasks:
+                task = self.ws_tasks['user_data']
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                del self.ws_tasks['user_data']
+                
+            if 'user_data' in self.ws_connections:
+                websocket = self.ws_connections['user_data']
+                await websocket.close()
+                del self.ws_connections['user_data']
+                
+            logger.info("User data stream stopped")
+        except Exception as e:
+            logger.error(f"Failed to stop user socket: {e}")
 
-async def __aexit__(self, exc_type, exc_val, exc_tb):
-    await self.stop_user_socket()
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.stop_user_socket()

@@ -463,8 +463,21 @@ class CopyTradingEngine:
             
             logger.info(f"📋 Found {len(configs)} active copy trading configurations for master {master_trade.account_id}")
             if len(configs) == 0:
-                logger.warning(f"⚠️ No copy trading configurations found for master {master_trade.account_id}")
-                logger.info(f"🔧 To set up copy trading, create a configuration linking master {master_trade.account_id} to follower accounts")
+                logger.warning(f"⚠️ NO COPY TRADING CONFIGURATIONS FOUND for master {master_trade.account_id}")
+                logger.warning(f"🔧 THIS IS WHY FOLLOWER ORDERS ARE NOT BEING PLACED!")
+                logger.info(f"💡 To fix this issue:")
+                logger.info(f"   1. Go to the dashboard configuration page")
+                logger.info(f"   2. Create a copy trading configuration linking master {master_trade.account_id} to follower accounts")
+                logger.info(f"   3. Or run the check_setup.py script to auto-create configurations")
+                
+                # Also log available follower accounts for reference
+                all_configs = session.query(CopyTradingConfig).all()
+                logger.info(f"🔍 Total copy trading configurations in database: {len(all_configs)}")
+                if all_configs:
+                    for config in all_configs:
+                        status = "ACTIVE" if config.is_active else "INACTIVE"
+                        logger.info(f"   - Config {config.id}: Master {config.master_account_id} -> Follower {config.follower_account_id} ({status})")
+                
                 return
             
             for config in configs:
@@ -472,8 +485,12 @@ class CopyTradingEngine:
                 
                 follower_client = self.follower_clients.get(config.follower_account_id)
                 if not follower_client:
-                    logger.warning(f"❌ Follower client not found for account {config.follower_account_id}")
-                    logger.info(f"🔧 Available follower clients: {list(self.follower_clients.keys())}")
+                    logger.error(f"❌ FOLLOWER CLIENT NOT FOUND for account {config.follower_account_id}")
+                    logger.error(f"🔧 Available follower clients: {list(self.follower_clients.keys())}")
+                    logger.error(f"💡 This means:")
+                    logger.error(f"   - The follower account {config.follower_account_id} is not loaded")
+                    logger.error(f"   - Check if the account is active and has valid API credentials")
+                    logger.error(f"   - Restart the bot to reload accounts")
                     continue
                 
                 logger.info(f"✅ Found follower client for account {config.follower_account_id}")
@@ -488,7 +505,16 @@ class CopyTradingEngine:
                     continue
                 
                 # Place the trade on follower account
-                await self.place_follower_trade(master_trade, config, follower_quantity, session)
+                try:
+                    logger.info(f"🚀 About to place follower trade: {master_trade.symbol} {master_trade.side} {follower_quantity}")
+                    await self.place_follower_trade(master_trade, config, follower_quantity, session)
+                    logger.info(f"✅ Successfully placed follower trade for account {config.follower_account_id}")
+                except Exception as follower_error:
+                    logger.error(f"❌ FAILED TO PLACE FOLLOWER TRADE for account {config.follower_account_id}: {follower_error}")
+                    import traceback
+                    logger.error(f"Full error traceback: {traceback.format_exc()}")
+                    # Continue with other followers instead of stopping completely
+                    continue
             
             # Mark master trade as copied
             master_trade.copied_from_master = True
