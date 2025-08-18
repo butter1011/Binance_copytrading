@@ -510,8 +510,17 @@ class BinanceClient:
                     min_qty = float(lot_size_filter['minQty'])
                     max_qty = float(lot_size_filter['maxQty'])
                     
-                    # Round to step size
-                    adjusted_qty = round(quantity / step_size) * step_size
+                    # Round to step size with proper precision handling
+                    steps = round(quantity / step_size)
+                    adjusted_qty = steps * step_size
+                    
+                    # Fix floating point precision issues
+                    # Count decimal places in step_size to determine proper rounding
+                    if '.' in str(step_size):
+                        decimal_places = len(str(step_size).split('.')[1])
+                        adjusted_qty = round(adjusted_qty, decimal_places)
+                    else:
+                        adjusted_qty = round(adjusted_qty)
                     
                     # Ensure within bounds
                     adjusted_qty = max(min_qty, min(adjusted_qty, max_qty))
@@ -520,10 +529,23 @@ class BinanceClient:
                         logger.info(f"📏 Adjusted quantity: {quantity} -> {adjusted_qty}")
                     
                     return adjusted_qty
-            return quantity
+                else:
+                    logger.warning(f"No LOT_SIZE filter found for {symbol}, using fallback precision")
+            else:
+                logger.warning(f"No symbol info found for {symbol}, using fallback precision")
+            
+            # Fallback: Round to 1 decimal place (common for most crypto futures)
+            fallback_qty = round(quantity, 1)
+            if fallback_qty != quantity:
+                logger.info(f"📏 Applied fallback precision: {quantity} -> {fallback_qty}")
+            return fallback_qty
+            
         except Exception as e:
             logger.warning(f"Failed to adjust quantity precision: {e}")
-            return quantity
+            # Emergency fallback: round to 1 decimal place
+            fallback_qty = round(quantity, 1)
+            logger.warning(f"Using emergency fallback precision: {quantity} -> {fallback_qty}")
+            return fallback_qty
 
     async def start_user_socket(self, callback):
         """Start user data stream using websockets"""

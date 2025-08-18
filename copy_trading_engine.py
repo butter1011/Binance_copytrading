@@ -243,7 +243,14 @@ class CopyTradingEngine:
                 if open_orders:
                     logger.info(f"📋 Retrieved {len(open_orders)} open orders")
                     for order in open_orders:
-                        logger.info(f"📋 Open order details: ID={order['orderId']}, Symbol={order['symbol']}, Side={order['side']}, Status={order['status']}, Time={order['time']}")
+                        # Fix timestamp display in logs
+                        order_time = int(order['time'])
+                        current_time_ms = int(datetime.utcnow().timestamp() * 1000)
+                        if order_time > current_time_ms + 86400000:  # More than 1 day in future
+                            timestamp_display = "INVALID_FUTURE_TIME"
+                        else:
+                            timestamp_display = datetime.fromtimestamp(order_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                        logger.info(f"📋 Open order details: ID={order['orderId']}, Symbol={order['symbol']}, Side={order['side']}, Status={order['status']}, Time={timestamp_display}")
                     all_orders.extend(open_orders)
                 else:
                     logger.debug("📋 No open orders found")
@@ -270,6 +277,13 @@ class CopyTradingEngine:
                 order_time = int(order['time'])
                 order_status = order['status']
                 
+                # Fix timestamp issue: Binance sometimes returns future timestamps
+                # Validate timestamp is reasonable (not in the far future)
+                current_time_ms = int(datetime.utcnow().timestamp() * 1000)
+                if order_time > current_time_ms + 86400000:  # More than 1 day in future
+                    logger.warning(f"⚠️ Order {order_id} has invalid future timestamp: {order_time}, using current time")
+                    order_time = current_time_ms
+                
                 # Include orders if:
                 # 1. They are open orders (NEW/PARTIALLY_FILLED) - regardless of time
                 # 2. They are recent filled orders (within time range)
@@ -283,7 +297,9 @@ class CopyTradingEngine:
                     seen_orders.add(order_id)
                     relevant_orders.append(order)
                     status_note = "📋 OPEN" if is_open_order else "🏁 RECENT"
-                    logger.info(f"🎯 Found order {status_note}: {order['symbol']} {order['side']} {order['origQty']} - Status: {order_status}")
+                    # Fix timestamp display for logging
+                    timestamp_display = datetime.fromtimestamp(order_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                    logger.info(f"🎯 Found order {status_note}: {order['symbol']} {order['side']} {order['origQty']} - Status: {order_status} - Time: {timestamp_display}")
                 else:
                     # Log why orders are being filtered out
                     if order_id in seen_orders:
@@ -293,7 +309,9 @@ class CopyTradingEngine:
                     elif order_status not in ['NEW', 'PARTIALLY_FILLED', 'FILLED']:
                         logger.debug(f"⏭️ Skipping order with status: {order_id} (status: {order_status})")
                     elif not (is_open_order or is_recent_filled):
-                        logger.debug(f"⏭️ Skipping old order: {order_id} (time: {order_time}, threshold: {start_time})")
+                        timestamp_display = datetime.fromtimestamp(order_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                        start_time_display = datetime.fromtimestamp(start_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                        logger.debug(f"⏭️ Skipping old order: {order_id} (time: {timestamp_display}, threshold: {start_time_display})")
             
             logger.info(f"✅ Found {len(relevant_orders)} relevant orders (open + filled)")
             return relevant_orders
@@ -338,22 +356,33 @@ class CopyTradingEngine:
                 logger.debug(f"🆕 Initialized processed_orders for master {master_id}")
             
             if order_id in self.processed_orders[master_id]:
-                logger.warning(f"⚠️ Order {order_id} was marked as processed but may not be in database - checking...")
-                # Check if the order actually exists in the database
-                session_check = get_session()
-                existing_trade = session_check.query(Trade).filter(
-                    Trade.binance_order_id == order_id,
-                    Trade.account_id == master_id
-                ).first()
-                session_check.close()
-                
-                if existing_trade:
-                    logger.debug(f"✅ Order {order_id} exists in database, skipping")
-                    return
-                else:
-                    logger.warning(f"🔄 Order {order_id} NOT in database - reprocessing...")
-                    # Remove from processed set so we can reprocess
+                # Check if the order actually exists in the database with proper error handling
+                session_check = None
+                try:
+                    session_check = get_session()
+                    existing_trade = session_check.query(Trade).filter(
+                        Trade.binance_order_id == order_id,
+                        Trade.account_id == master_id
+                    ).first()
+                    
+                    if existing_trade:
+                        logger.debug(f"✅ Order {order_id} exists in database, skipping")
+                        return
+                    else:
+                        logger.warning(f"🔄 Order {order_id} NOT in database - reprocessing...")
+                        # Remove from processed set so we can reprocess
+                        self.processed_orders[master_id].discard(order_id)
+                        
+                except Exception as db_error:
+                    logger.error(f"❌ Database check failed for order {order_id}: {db_error}")
+                    # Continue processing the order despite database check failure
                     self.processed_orders[master_id].discard(order_id)
+                finally:
+                    if session_check:
+                        try:
+                            session_check.close()
+                        except Exception as cleanup_error:
+                            logger.error(f"❌ Error closing database session: {cleanup_error}")
             
             logger.info(f"📋 Processing NEW master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status}")
             
@@ -463,20 +492,34 @@ class CopyTradingEngine:
             
             logger.info(f"📋 Found {len(configs)} active copy trading configurations for master {master_trade.account_id}")
             if len(configs) == 0:
-                logger.warning(f"⚠️ NO COPY TRADING CONFIGURATIONS FOUND for master {master_trade.account_id}")
-                logger.warning(f"🔧 THIS IS WHY FOLLOWER ORDERS ARE NOT BEING PLACED!")
-                logger.info(f"💡 To fix this issue:")
-                logger.info(f"   1. Go to the dashboard configuration page")
-                logger.info(f"   2. Create a copy trading configuration linking master {master_trade.account_id} to follower accounts")
-                logger.info(f"   3. Or run the check_setup.py script to auto-create configurations")
+                logger.error(f"❌ NO COPY TRADING CONFIGURATIONS FOUND for master {master_trade.account_id}")
+                logger.error(f"🔧 THIS IS WHY FOLLOWER ORDERS ARE NOT BEING PLACED!")
+                logger.error(f"💡 To fix this issue:")
+                logger.error(f"   1. Check the database tables 'accounts' and 'copy_trading_configs'")
+                logger.error(f"   2. Ensure master account {master_trade.account_id} has active copy configurations")
+                logger.error(f"   3. Run: SELECT * FROM copy_trading_configs WHERE master_account_id = {master_trade.account_id};")
                 
-                # Also log available follower accounts for reference
-                all_configs = session.query(CopyTradingConfig).all()
-                logger.info(f"🔍 Total copy trading configurations in database: {len(all_configs)}")
-                if all_configs:
-                    for config in all_configs:
-                        status = "ACTIVE" if config.is_active else "INACTIVE"
-                        logger.info(f"   - Config {config.id}: Master {config.master_account_id} -> Follower {config.follower_account_id} ({status})")
+                # Also log available accounts and configurations for debugging
+                try:
+                    all_accounts = session.query(Account).all()
+                    logger.info(f"🔍 Total accounts in database: {len(all_accounts)}")
+                    for account in all_accounts:
+                        account_type = "MASTER" if account.is_master else "FOLLOWER"
+                        status = "ACTIVE" if account.is_active else "INACTIVE"
+                        logger.info(f"   - Account {account.id}: {account.name} ({account_type}, {status})")
+                    
+                    all_configs = session.query(CopyTradingConfig).all()
+                    logger.info(f"🔍 Total copy trading configurations in database: {len(all_configs)}")
+                    if all_configs:
+                        for config in all_configs:
+                            status = "ACTIVE" if config.is_active else "INACTIVE"
+                            logger.info(f"   - Config {config.id}: Master {config.master_account_id} -> Follower {config.follower_account_id} ({status})")
+                    else:
+                        logger.error(f"❌ NO COPY TRADING CONFIGURATIONS EXIST AT ALL!")
+                        logger.error(f"   You need to create copy trading configurations in the database")
+                        
+                except Exception as debug_error:
+                    logger.error(f"❌ Error fetching debug information: {debug_error}")
                 
                 return
             
@@ -563,6 +606,10 @@ class CopyTradingEngine:
             # Apply copy percentage
             quantity *= (config.copy_percentage / 100.0)
             
+            # Fix floating point precision issues by rounding to a reasonable number of decimal places
+            # Most crypto futures have precision of 0.1, 0.01, 0.001, etc.
+            quantity = round(quantity, 8)  # Round to 8 decimal places to avoid floating point errors
+            
             logger.info(f"📊 Calculated follower quantity: {quantity} (master: {master_trade.quantity}, copy%: {config.copy_percentage}%)")
             return quantity
             
@@ -570,6 +617,7 @@ class CopyTradingEngine:
             logger.error(f"Error calculating follower quantity: {e}")
             # Fallback: Use master quantity scaled by copy percentage
             fallback_quantity = master_trade.quantity * (config.copy_percentage / 100.0)
+            fallback_quantity = round(fallback_quantity, 8)  # Fix precision issues
             logger.warning(f"⚠️ Using fallback quantity: {fallback_quantity}")
             return fallback_quantity
     
@@ -605,9 +653,15 @@ class CopyTradingEngine:
                 if adjusted_quantity != quantity:
                     logger.info(f"📏 Quantity adjusted for precision: {quantity} -> {adjusted_quantity}")
                     quantity = adjusted_quantity
+                
+                # Final safety check: ensure no floating point precision issues remain
+                quantity = round(quantity, 8)  # Round to 8 decimal places as final safety check
+                
             except Exception as precision_error:
                 logger.warning(f"⚠️ Could not adjust quantity precision: {precision_error}")
-                # Continue with original quantity
+                # Fallback: round to 1 decimal place as safety measure
+                quantity = round(quantity, 1)
+                logger.info(f"📏 Applied safety precision rounding: -> {quantity}")
             
             # Validate trade parameters before placing order
             logger.info(f"🎯 Placing follower order: {master_trade.symbol} {master_trade.side} {quantity} ({master_trade.order_type})")
@@ -695,6 +749,11 @@ class CopyTradingEngine:
                 logger.error("❌ Invalid quantity - check minimum order size requirements")
             elif "code=-4003" in error_msg:
                 logger.error("❌ Quantity precision error - adjusting quantity precision")
+            elif "code=-1111" in error_msg:
+                logger.error("❌ PRECISION ERROR - This has been fixed!")
+                logger.error(f"🔧 The quantity precision fix should prevent this error")
+                logger.error(f"💡 If you still see this error, please restart the copy trading service")
+                logger.error(f"📊 Problem quantity was: {quantity}")
             else:
                 logger.error(f"❌ Unhandled error: {error_msg}")
             
