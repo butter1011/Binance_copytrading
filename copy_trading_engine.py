@@ -408,12 +408,11 @@ class CopyTradingEngine:
                 # Include orders if:
                 # 1. They are open orders (NEW/PARTIALLY_FILLED) - regardless of time
                 # 2. They are recent filled orders (within time range)
-                # 3. They are recent cancelled/expired orders (need to cancel followers) - but only very recent ones
+                # 3. They are recent cancelled/expired orders (need to cancel followers)
                 is_open_order = order_status in ['NEW', 'PARTIALLY_FILLED']
                 is_recent_filled = order_status == 'FILLED' and order_time >= start_time
-                # For cancelled orders, only process very recent ones (last 5 minutes) to avoid repetitive processing
-                recent_cancelled_threshold = int((datetime.utcnow() - timedelta(minutes=5)).timestamp() * 1000)
-                is_recent_cancelled = order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and order_time >= recent_cancelled_threshold
+                # For cancelled orders, process recent ones (within normal time range) to handle follower cancellations
+                is_recent_cancelled = order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and order_time >= start_time
                 
                 if (order_id not in seen_orders and 
                     order['side'] in ['BUY', 'SELL'] and 
@@ -575,9 +574,13 @@ class CopyTradingEngine:
                     await self.handle_master_order_cancellation_with_trade(existing_master_trade, session)
                 else:
                     logger.info(f"📝 No existing master trade found for cancelled order {order_id}")
-                    # This might be an order that was cancelled before it was copied
-                    # Still log it to prevent reprocessing
-                    self.add_system_log("INFO", f"🚫 Master order cancelled (not copied): {order.get('symbol')} {order.get('side')} {order_id}", master_id)
+                    # Search for follower trades by order symbol, side, and time range
+                    # This catches cases where the master order was cancelled before the trade record was created
+                    logger.info(f"🔍 Searching for follower trades by order details: {order.get('symbol')} {order.get('side')}")
+                    await self.handle_cancellation_by_order_details(master_id, order, session)
+                    
+                    # Log the cancellation
+                    self.add_system_log("INFO", f"🚫 Master order cancelled: {order.get('symbol')} {order.get('side')} {order_id}", master_id)
                 
                 session.close()
                 return
@@ -1268,6 +1271,94 @@ class CopyTradingEngine:
                 
         except Exception as e:
             logger.error(f"❌ Error handling master order cancellation with trade: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            session.rollback()
+
+    async def handle_cancellation_by_order_details(self, master_id: int, order: dict, session: Session):
+        """Handle cancellation by searching for follower trades using order details"""
+        try:
+            order_symbol = order.get('symbol')
+            order_side = order.get('side')
+            order_time = datetime.fromtimestamp(order.get('time', order.get('updateTime', 0)) / 1000)
+            order_quantity = float(order.get('origQty', 0))
+            
+            logger.info(f"🔍 Searching for follower trades to cancel: {order_symbol} {order_side} {order_quantity}")
+            
+            # Search for recent follower trades that match this order criteria
+            # Look for orders placed within a reasonable time window (last 30 minutes)
+            time_window = order_time - timedelta(minutes=30), order_time + timedelta(minutes=30)
+            
+            follower_trades = session.query(Trade).filter(
+                Trade.symbol == order_symbol,
+                Trade.side == order_side,
+                Trade.copied_from_master == True,
+                Trade.status.in_(['PENDING', 'PARTIALLY_FILLED']),  # Only active orders
+                Trade.created_at >= time_window[0],
+                Trade.created_at <= time_window[1]
+            ).all()
+            
+            logger.info(f"🔍 Found {len(follower_trades)} potential follower trades to cancel")
+            
+            # Get copy trading configurations for this master to filter relevant followers
+            configs = session.query(CopyTradingConfig).filter(
+                CopyTradingConfig.master_account_id == master_id,
+                CopyTradingConfig.is_active == True
+            ).all()
+            
+            relevant_follower_ids = {config.follower_account_id for config in configs}
+            
+            # Filter trades to only those from relevant followers
+            relevant_trades = [
+                trade for trade in follower_trades 
+                if trade.account_id in relevant_follower_ids
+            ]
+            
+            logger.info(f"🔍 Found {len(relevant_trades)} relevant follower trades to cancel")
+            
+            cancelled_count = 0
+            for follower_trade in relevant_trades:
+                try:
+                    follower_client = self.follower_clients.get(follower_trade.account_id)
+                    if not follower_client:
+                        logger.error(f"❌ Follower client not found for account {follower_trade.account_id}")
+                        continue
+                    
+                    if follower_trade.binance_order_id:
+                        logger.info(f"🚫 Cancelling follower order: {follower_trade.symbol} {follower_trade.side} {follower_trade.quantity} for account {follower_trade.account_id}")
+                        
+                        # Cancel the order on Binance
+                        success = await follower_client.cancel_order(
+                            follower_trade.symbol, 
+                            str(follower_trade.binance_order_id)
+                        )
+                        
+                        if success:
+                            # Update follower trade status
+                            follower_trade.status = 'CANCELLED'
+                            session.commit()
+                            cancelled_count += 1
+                            
+                            logger.info(f"✅ Cancelled follower order {follower_trade.binance_order_id} for account {follower_trade.account_id}")
+                            self.add_system_log("INFO", f"🚫 Cancelled follower order: {follower_trade.symbol} {follower_trade.side} (master order cancelled)", follower_trade.account_id, follower_trade.id)
+                        else:
+                            logger.error(f"❌ Failed to cancel follower order {follower_trade.binance_order_id} for account {follower_trade.account_id}")
+                            self.add_system_log("ERROR", f"❌ Failed to cancel follower order: {follower_trade.symbol}", follower_trade.account_id, follower_trade.id)
+                    else:
+                        logger.warning(f"⚠️ No Binance order ID found for follower trade {follower_trade.id}")
+                        
+                except Exception as cancel_error:
+                    logger.error(f"❌ Error cancelling follower trade {follower_trade.id}: {cancel_error}")
+                    self.add_system_log("ERROR", f"❌ Error cancelling follower order: {cancel_error}", follower_trade.account_id, follower_trade.id)
+            
+            if cancelled_count > 0:
+                logger.info(f"✅ Successfully cancelled {cancelled_count} follower orders by order details")
+                self.add_system_log("INFO", f"🚫 Master order cancelled - {cancelled_count} follower orders cancelled by details search", master_id)
+            else:
+                logger.info(f"ℹ️ No follower orders found to cancel for master order cancellation")
+                
+        except Exception as e:
+            logger.error(f"❌ Error handling cancellation by order details: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             session.rollback()
