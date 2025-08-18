@@ -27,6 +27,7 @@ class CopyTradingEngine:
         self.monitoring_tasks = {}
         self.last_trade_check = {}
         self.processed_orders = {}  # account_id -> set of order_ids to avoid duplicates
+        self.last_processed_order_time = {}  # account_id -> datetime to avoid processing old orders on restart
         logger.info("🏗️ CopyTradingEngine initialized")
         
     async def initialize(self):
@@ -37,6 +38,9 @@ class CopyTradingEngine:
             # Load all accounts and configurations
             await self.load_accounts()
             await self.setup_copy_trading_configs()
+            
+            # Initialize order tracking to prevent duplicate trades on restart
+            await self.initialize_order_tracking()
             
             logger.info("Copy trading engine initialized successfully")
             return True
@@ -67,6 +71,43 @@ class CopyTradingEngine:
             # Log to file as fallback
             log_func = getattr(logger, level.lower(), logger.info)
             log_func(f"[FALLBACK] {message}")
+    
+    async def initialize_order_tracking(self):
+        """Initialize order tracking to prevent duplicates on restart"""
+        try:
+            logger.info("🔄 Initializing order tracking to prevent restart duplicates...")
+            current_time = datetime.utcnow()
+            
+            # Set last processed time to current time for all master accounts
+            # This prevents processing old orders when the bot restarts
+            for master_id in self.master_clients.keys():
+                self.last_processed_order_time[master_id] = current_time
+                self.processed_orders[master_id] = set()
+                logger.info(f"🕒 Set last processed time for master {master_id} to {current_time}")
+                
+                # Also log recent database trades to avoid reprocessing
+                try:
+                    session = get_session()
+                    recent_trades = session.query(Trade).filter(
+                        Trade.account_id == master_id,
+                        Trade.created_at >= current_time - timedelta(hours=24)  # Last 24 hours
+                    ).all()
+                    
+                    for trade in recent_trades:
+                        if trade.binance_order_id:
+                            self.processed_orders[master_id].add(str(trade.binance_order_id))
+                    
+                    logger.info(f"📋 Loaded {len(recent_trades)} recent orders for master {master_id} to prevent duplicates")
+                    session.close()
+                    
+                except Exception as db_error:
+                    logger.warning(f"⚠️ Could not load recent orders for master {master_id}: {db_error}")
+                    
+            self.add_system_log("INFO", "🔄 Order tracking initialized - old orders will not be reprocessed on restart")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize order tracking: {e}")
+            self.add_system_log("ERROR", f"Failed to initialize order tracking: {e}")
     
     async def load_accounts(self):
         """Load all accounts from database"""
@@ -371,8 +412,15 @@ class CopyTradingEngine:
             order_status = order['status']
             executed_qty = float(order.get('executedQty', 0))
             original_qty = float(order['origQty'])
+            order_time = datetime.fromtimestamp(order.get('time', order.get('updateTime', 0)) / 1000)
             
-            logger.info(f"🎯 Starting to process master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status}")
+            logger.info(f"🎯 Starting to process master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status} - Time: {order_time}")
+            
+            # Check if this order is from before restart (prevent duplicate processing)
+            if master_id in self.last_processed_order_time:
+                if order_time < self.last_processed_order_time[master_id]:
+                    logger.info(f"⏭️ Skipping old order {order_id} from {order_time} (before restart time {self.last_processed_order_time[master_id]})")
+                    return
             
             # Check if we've already processed this order
             if master_id not in self.processed_orders:
@@ -627,25 +675,25 @@ class CopyTradingEngine:
                 base_quantity *= config.risk_multiplier
                 logger.info(f"📊 After risk multiplier {config.risk_multiplier}: {base_quantity}")
             
-            # Get follower account balance for minimum safety check
+            # DISABLE AGGRESSIVE SAFETY CHECKS - they were reducing position sizes incorrectly
+            # Only do basic minimum order checks, not balance-based reductions
             try:
                 follower_balance = await follower_client.get_balance()
                 if follower_balance > 0:
-                    # Safety check: ensure the position doesn't exceed reasonable limits
-                    # Calculate approximate notional value
+                    logger.info(f"📊 Follower balance: ${follower_balance:.2f}")
+                    # Only warn if position is extremely large, but don't auto-reduce
                     mark_price = await follower_client.get_mark_price(master_trade.symbol)
                     notional_value = base_quantity * mark_price
-                    max_safe_notional = follower_balance * 0.8  # Use max 80% of balance
+                    logger.info(f"📊 Position notional value: ${notional_value:.2f}")
                     
-                    if notional_value > max_safe_notional:
-                        safety_quantity = (max_safe_notional / mark_price) * 0.9  # 90% of safe limit
-                        logger.warning(f"⚠️ Position size {base_quantity} too large for balance. Reducing to {safety_quantity}")
-                        base_quantity = safety_quantity
+                    # Only warn, don't reduce automatically
+                    if notional_value > follower_balance:
+                        logger.warning(f"⚠️ Position notional (${notional_value:.2f}) exceeds balance (${follower_balance:.2f}). Consider reducing copy percentage manually.")
                 else:
                     logger.warning(f"⚠️ Could not get follower balance for safety check")
             except Exception as balance_error:
                 logger.warning(f"⚠️ Balance safety check failed: {balance_error}")
-                # Continue with calculated quantity
+                # Continue with calculated quantity - don't reduce based on balance errors
             
             quantity = base_quantity
             

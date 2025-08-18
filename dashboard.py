@@ -148,11 +148,14 @@ def update_system_data():
                 trades_data = trades
                 socketio.emit('trades_update', trades)
             
-            # Update logs data
-            logs = fetch_api_data("/logs", {"limit": 50})
+            # Update logs data with more detailed logging
+            logs = fetch_api_data("/logs", {"limit": 100})  # Increased limit
             if logs is not None:
                 logs_data = logs
                 socketio.emit('logs_update', logs)
+                logging.info(f"📋 Updated {len(logs)} logs to dashboard")
+            else:
+                logging.warning("⚠️ No logs data received from API")
                 
         except Exception as e:
             logging.error(f"Error updating system data: {e}")
@@ -371,8 +374,21 @@ def handle_trades_request():
 
 @socketio.on('request_logs')
 def handle_logs_request():
-    """Handle logs request"""
-    emit('logs_update', logs_data)
+    """Handle logs request with fresh data fetch"""
+    global logs_data
+    try:
+        # Try to fetch fresh logs from API
+        fresh_logs = fetch_api_data("/logs", {"limit": 100})
+        if fresh_logs is not None:
+            logs_data = fresh_logs
+            logging.info(f"📋 Fetched {len(fresh_logs)} fresh logs for dashboard")
+        else:
+            logging.warning("⚠️ Could not fetch fresh logs, using cached data")
+        
+        emit('logs_update', logs_data if logs_data else [])
+    except Exception as e:
+        logging.error(f"Error handling logs request: {e}")
+        emit('logs_update', [])
 
 @socketio.on('request_copy_configs')
 def handle_copy_configs_request():
