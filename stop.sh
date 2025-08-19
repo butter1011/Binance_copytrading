@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Copy Trading Bot - Stop Script
-# Stops the bot running in background
+# Stops the bot running in background (Linux and macOS compatible)
 
 echo "========================================"
 echo "COPY TRADING BOT - STOP SCRIPT"

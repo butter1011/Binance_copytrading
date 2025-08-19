@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Copy Trading Bot - Status Check Script
-# Check if the bot is running and show status
+# Check if the bot is running and show status (Linux and macOS compatible)
 
 echo "========================================"
 echo "COPY TRADING BOT - STATUS CHECK"

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Copy Trading Bot - Background Start Script
-# Runs the bot in background using screen or tmux
+# Runs the bot in background using screen or tmux (Linux and macOS compatible)
 
 set -e  # Exit on any error
 
@@ -30,7 +30,21 @@ print_error() {
 # Check if virtual environment exists
 if [ ! -f "venv/bin/activate" ]; then
     print_error "Virtual environment not found!"
-    print_info "Please run ./install_ubuntu.sh first"
+    
+    # Detect OS and suggest appropriate install script
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        print_info "Please run ./install_macos.sh first"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        if command -v apt &> /dev/null; then
+            print_info "Please run ./install_ubuntu.sh first"
+        elif command -v yum &> /dev/null; then
+            print_info "Please run ./install_centos.sh first"
+        else
+            print_info "Please run ./install_manual.sh first"
+        fi
+    else
+        print_info "Please run the appropriate install script for your system first"
+    fi
     exit 1
 fi
 
@@ -106,8 +120,31 @@ elif command -v tmux &> /dev/null; then
 
 else
     print_error "Neither screen nor tmux found!"
-    print_info "Installing screen..."
-    sudo apt install -y screen
-    print_info "Please run this script again"
+    
+    # Detect OS and suggest installation method
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        print_info "Installing screen via Homebrew..."
+        if command -v brew &> /dev/null; then
+            brew install screen
+            print_info "Please run this script again"
+        else
+            print_error "Homebrew not found. Please install screen manually:"
+            print_info "brew install screen"
+        fi
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        if command -v apt &> /dev/null; then
+            print_info "Installing screen..."
+            sudo apt install -y screen
+            print_info "Please run this script again"
+        elif command -v yum &> /dev/null; then
+            print_info "Installing screen..."
+            sudo yum install -y screen
+            print_info "Please run this script again"
+        else
+            print_error "Please install screen or tmux manually"
+        fi
+    else
+        print_error "Please install screen or tmux manually for your system"
+    fi
     exit 1
 fi

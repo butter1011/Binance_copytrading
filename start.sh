@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Copy Trading Bot - Ubuntu Start Script
-# Equivalent to start.bat for Windows
+# Copy Trading Bot - Start Script
+# Cross-platform startup script for Linux and macOS
 
 set -e  # Exit on any error
 
@@ -30,7 +30,22 @@ print_error() {
 # Check if virtual environment exists
 if [ ! -f "venv/bin/activate" ]; then
     print_error "Virtual environment not found!"
-    print_info "Please run ./install_ubuntu.sh first to create the virtual environment"
+    
+    # Detect OS and suggest appropriate install script
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        print_info "Please run ./install_macos.sh first to create the virtual environment"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        if command -v apt &> /dev/null; then
+            print_info "Please run ./install_ubuntu.sh first to create the virtual environment"
+        elif command -v yum &> /dev/null; then
+            print_info "Please run ./install_centos.sh first to create the virtual environment"
+        else
+            print_info "Please run ./install_manual.sh first to create the virtual environment"
+        fi
+    else
+        print_info "Please run the appropriate install script for your system first"
+        print_info "Available options: install_macos.sh, install_ubuntu.sh, install_centos.sh, install_manual.sh"
+    fi
     echo
     exit 1
 fi
