@@ -652,6 +652,179 @@ async def clear_all_logs(db = Depends(get_db)):
         logger.error(f"Error clearing all logs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Position sizing and risk management
+@app.get("/position-sizing/simulate/{master_account_id}/{follower_account_id}")
+async def simulate_position_sizing(
+    master_account_id: int, 
+    follower_account_id: int,
+    symbol: str,
+    master_quantity: float,
+    master_price: float,
+    db = Depends(get_db)
+):
+    """Simulate position sizing calculation for a trade"""
+    try:
+        from copy_trading_engine import copy_trading_engine
+        from models import Account, CopyTradingConfig, Trade
+        
+        # Get accounts
+        master_account = db.query(Account).filter(Account.id == master_account_id).first()
+        follower_account = db.query(Account).filter(Account.id == follower_account_id).first()
+        
+        if not master_account or not follower_account:
+            raise HTTPException(status_code=404, detail="Account not found")
+        
+        # Get copy trading config
+        config = db.query(CopyTradingConfig).filter(
+            CopyTradingConfig.master_account_id == master_account_id,
+            CopyTradingConfig.follower_account_id == follower_account_id,
+            CopyTradingConfig.is_active == True
+        ).first()
+        
+        if not config:
+            raise HTTPException(status_code=404, detail="Copy trading configuration not found")
+        
+        # Get follower client
+        follower_client = copy_trading_engine.follower_clients.get(follower_account_id)
+        if not follower_client:
+            raise HTTPException(status_code=400, detail="Follower client not available")
+        
+        # Create a mock trade for simulation
+        mock_trade = Trade(
+            account_id=master_account_id,
+            symbol=symbol,
+            side='BUY',
+            order_type='MARKET',
+            quantity=master_quantity,
+            price=master_price,
+            status='FILLED'
+        )
+        
+        # Calculate follower quantity using the new system
+        follower_quantity = await copy_trading_engine.calculate_follower_quantity(
+            mock_trade, config, follower_client
+        )
+        
+        # Get additional metrics
+        follower_balance = await follower_client.get_balance()
+        mark_price = await follower_client.get_mark_price(symbol)
+        
+        # Calculate risk metrics
+        follower_notional = follower_quantity * mark_price
+        risk_percentage = (follower_notional / follower_balance) * 100 if follower_balance > 0 else 0
+        effective_leverage = follower_notional / follower_balance if follower_balance > 0 else 0
+        
+        return {
+            "master_trade": {
+                "quantity": master_quantity,
+                "price": master_price,
+                "notional_value": master_quantity * master_price
+            },
+            "follower_calculation": {
+                "quantity": follower_quantity,
+                "notional_value": follower_notional,
+                "risk_percentage": risk_percentage,
+                "effective_leverage": effective_leverage
+            },
+            "account_info": {
+                "follower_balance": follower_balance,
+                "follower_risk_setting": follower_account.risk_percentage,
+                "follower_leverage_setting": follower_account.leverage,
+                "copy_percentage": config.copy_percentage,
+                "risk_multiplier": config.risk_multiplier
+            },
+            "symbol_info": {
+                "symbol": symbol,
+                "mark_price": mark_price
+            },
+            "safety_analysis": {
+                "is_safe": risk_percentage <= 10.0,  # Safe if <= 10% risk
+                "risk_level": "LOW" if risk_percentage <= 5.0 else "MEDIUM" if risk_percentage <= 10.0 else "HIGH",
+                "leverage_warning": effective_leverage > follower_account.leverage * 0.8
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error simulating position sizing: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/accounts/{account_id}/risk-analysis")
+async def get_account_risk_analysis(account_id: int, db = Depends(get_db)):
+    """Get detailed risk analysis for an account"""
+    try:
+        from copy_trading_engine import copy_trading_engine
+        
+        # Get account
+        account = db.query(Account).filter(Account.id == account_id).first()
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+        
+        # Get client
+        if account.is_master:
+            client = copy_trading_engine.master_clients.get(account_id)
+        else:
+            client = copy_trading_engine.follower_clients.get(account_id)
+        
+        if not client:
+            raise HTTPException(status_code=400, detail="Account client not available")
+        
+        # Get balance and positions
+        balance = await client.get_balance()
+        positions = await client.get_positions()
+        
+        # Calculate portfolio metrics
+        total_position_value = 0
+        position_details = []
+        
+        for position in positions:
+            if position.get('size', 0) != 0:
+                size = float(position.get('size', 0))
+                mark_price = float(position.get('markPrice', 0))
+                position_value = abs(size) * mark_price
+                total_position_value += position_value
+                
+                position_details.append({
+                    "symbol": position.get('symbol'),
+                    "side": position.get('side'),
+                    "size": size,
+                    "mark_price": mark_price,
+                    "position_value": position_value,
+                    "unrealized_pnl": float(position.get('unrealizedProfit', 0))
+                })
+        
+        portfolio_risk = (total_position_value / balance) * 100 if balance > 0 else 0
+        
+        return {
+            "account_info": {
+                "id": account_id,
+                "name": account.name,
+                "is_master": account.is_master,
+                "balance": balance,
+                "risk_percentage_setting": account.risk_percentage,
+                "leverage_setting": account.leverage
+            },
+            "portfolio_metrics": {
+                "total_position_value": total_position_value,
+                "portfolio_risk_percentage": portfolio_risk,
+                "number_of_positions": len(position_details),
+                "available_margin": balance - (total_position_value / account.leverage) if account.leverage > 0 else balance
+            },
+            "positions": position_details,
+            "risk_analysis": {
+                "risk_level": "LOW" if portfolio_risk <= 30 else "MEDIUM" if portfolio_risk <= 60 else "HIGH",
+                "is_overexposed": portfolio_risk > 80,
+                "margin_ratio": (total_position_value / account.leverage) / balance if balance > 0 and account.leverage > 0 else 0,
+                "recommendations": [
+                    "Consider reducing position sizes" if portfolio_risk > 60 else "Portfolio risk is acceptable",
+                    "Monitor margin closely" if portfolio_risk > 80 else "Margin usage is safe"
+                ]
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting risk analysis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Account balance and positions
 @app.get("/accounts/{account_id}/balance")
 async def get_account_balance(account_id: int, db = Depends(get_db)):

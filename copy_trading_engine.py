@@ -772,64 +772,221 @@ class CopyTradingEngine:
             session.rollback()
     
     async def calculate_follower_quantity(self, master_trade: Trade, config: CopyTradingConfig, follower_client: BinanceClient) -> float:
-        """Calculate the quantity for follower trade based on copy percentage (simplified)"""
+        """Calculate the quantity for follower trade based on balance, risk management, and leverage"""
         try:
             session = get_session()
             follower_account = session.query(Account).filter(Account.id == config.follower_account_id).first()
+            master_account = session.query(Account).filter(Account.id == master_trade.account_id).first()
             session.close()
             
             if not follower_account:
                 logger.error(f"❌ Follower account {config.follower_account_id} not found in database")
                 return 0
             
-            # SIMPLIFIED APPROACH: Use master quantity with copy percentage
-            # This provides 1:1 copying with percentage scaling, which is more predictable
-            base_quantity = master_trade.quantity * (config.copy_percentage / 100.0)
+            if not master_account:
+                logger.error(f"❌ Master account {master_trade.account_id} not found in database")
+                return 0
             
-            # Log the calculation for transparency
-            logger.info(f"📊 Simple copy calculation: Master {master_trade.quantity} * Copy% {config.copy_percentage}% = {base_quantity}")
+            # Get current account balances
+            follower_balance = await follower_client.get_balance()
+            if follower_balance <= 0:
+                logger.warning(f"⚠️ Could not get follower balance or balance is zero")
+                return await self.calculate_fallback_quantity(master_trade, config)
             
-            # Optional: Apply risk multiplier if user wants additional scaling
-            if config.risk_multiplier != 1.0:
-                base_quantity *= config.risk_multiplier
-                logger.info(f"📊 After risk multiplier {config.risk_multiplier}: {base_quantity}")
-            
-            # DISABLE AGGRESSIVE SAFETY CHECKS - they were reducing position sizes incorrectly
-            # Only do basic minimum order checks, not balance-based reductions
+            # Get mark price for the symbol
             try:
-                follower_balance = await follower_client.get_balance()
-                if follower_balance > 0:
-                    logger.info(f"📊 Follower balance: ${follower_balance:.2f}")
-                    # Only warn if position is extremely large, but don't auto-reduce
-                    mark_price = await follower_client.get_mark_price(master_trade.symbol)
-                    notional_value = base_quantity * mark_price
-                    logger.info(f"📊 Position notional value: ${notional_value:.2f}")
-                    
-                    # Only warn, don't reduce automatically
-                    if notional_value > follower_balance:
-                        logger.warning(f"⚠️ Position notional (${notional_value:.2f}) exceeds balance (${follower_balance:.2f}). Consider reducing copy percentage manually.")
-                else:
-                    logger.warning(f"⚠️ Could not get follower balance for safety check")
-            except Exception as balance_error:
-                logger.warning(f"⚠️ Balance safety check failed: {balance_error}")
-                # Continue with calculated quantity - don't reduce based on balance errors
+                mark_price = await follower_client.get_mark_price(master_trade.symbol)
+                if mark_price <= 0:
+                    mark_price = master_trade.price if master_trade.price > 0 else 1.0
+            except Exception:
+                mark_price = master_trade.price if master_trade.price > 0 else 1.0
             
-            quantity = base_quantity
+            logger.info(f"📊 Risk-based calculation starting:")
+            logger.info(f"   Follower balance: ${follower_balance:.2f}")
+            logger.info(f"   Follower risk%: {follower_account.risk_percentage}%")
+            logger.info(f"   Follower leverage: {follower_account.leverage}x")
+            logger.info(f"   Symbol price: ${mark_price:.4f}")
             
-            # Fix floating point precision issues by rounding to a reasonable number of decimal places
-            # Most crypto futures have precision of 0.1, 0.01, 0.001, etc.
-            quantity = round(quantity, 8)  # Round to 8 decimal places to avoid floating point errors
+            # OPTION 1: Risk-Based Position Sizing (Recommended)
+            if follower_account.risk_percentage > 0:
+                quantity = await self.calculate_risk_based_quantity(
+                    follower_balance, follower_account, mark_price, master_trade, config
+                )
+                logger.info(f"📊 Using risk-based sizing: {quantity}")
+            else:
+                # OPTION 2: Fallback to balance-proportional sizing
+                quantity = await self.calculate_balance_proportional_quantity(
+                    follower_balance, mark_price, master_trade, config
+                )
+                logger.info(f"📊 Using balance-proportional sizing: {quantity}")
             
-            logger.info(f"📊 Calculated follower quantity: {quantity} (master: {master_trade.quantity}, copy%: {config.copy_percentage}%)")
+            # Apply copy percentage as final scaling factor
+            quantity *= (config.copy_percentage / 100.0)
+            logger.info(f"📊 After copy percentage {config.copy_percentage}%: {quantity}")
+            
+            # Apply risk multiplier
+            if config.risk_multiplier != 1.0:
+                quantity *= config.risk_multiplier
+                logger.info(f"📊 After risk multiplier {config.risk_multiplier}: {quantity}")
+            
+            # Safety checks and limits
+            quantity = await self.apply_safety_limits(quantity, follower_balance, mark_price, follower_account, master_trade)
+            
+            # Fix floating point precision
+            quantity = round(quantity, 8)
+            
+            # Final validation
+            if quantity <= 0:
+                logger.warning(f"⚠️ Calculated quantity is zero or negative: {quantity}")
+                return 0
+            
+            # Calculate notional value for logging
+            notional_value = quantity * mark_price
+            risk_percentage_actual = (notional_value / follower_balance) * 100
+            
+            logger.info(f"📊 FINAL CALCULATION RESULT:")
+            logger.info(f"   Quantity: {quantity}")
+            logger.info(f"   Notional value: ${notional_value:.2f}")
+            logger.info(f"   Risk percentage: {risk_percentage_actual:.2f}%")
+            logger.info(f"   Master quantity: {master_trade.quantity} (for comparison)")
+            
             return quantity
             
         except Exception as e:
             logger.error(f"Error calculating follower quantity: {e}")
-            # Fallback: Use master quantity scaled by copy percentage
-            fallback_quantity = master_trade.quantity * (config.copy_percentage / 100.0)
-            fallback_quantity = round(fallback_quantity, 8)  # Fix precision issues
-            logger.warning(f"⚠️ Using fallback quantity: {fallback_quantity}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return await self.calculate_fallback_quantity(master_trade, config)
+    
+    async def calculate_risk_based_quantity(self, follower_balance: float, follower_account, mark_price: float, master_trade: Trade, config: CopyTradingConfig) -> float:
+        """Calculate position size based on account risk percentage and leverage"""
+        try:
+            # Calculate the maximum risk amount per trade
+            risk_amount = follower_balance * (follower_account.risk_percentage / 100.0)
+            
+            # With leverage, we can control more value than our risk amount
+            # Position Value = Risk Amount × Leverage
+            max_position_value = risk_amount * follower_account.leverage
+            
+            # Calculate quantity based on position value
+            quantity = max_position_value / mark_price
+            
+            logger.info(f"📊 Risk-based calculation:")
+            logger.info(f"   Risk amount: ${risk_amount:.2f} ({follower_account.risk_percentage}% of ${follower_balance:.2f})")
+            logger.info(f"   Max position value: ${max_position_value:.2f} (risk × {follower_account.leverage}x leverage)")
+            logger.info(f"   Calculated quantity: {quantity}")
+            
+            return quantity
+            
+        except Exception as e:
+            logger.error(f"Error in risk-based calculation: {e}")
+            return 0
+    
+    async def calculate_balance_proportional_quantity(self, follower_balance: float, mark_price: float, master_trade: Trade, config: CopyTradingConfig) -> float:
+        """Calculate position size proportional to account balance"""
+        try:
+            # Use a conservative approach: risk 2% of balance per trade
+            conservative_risk_percentage = 2.0
+            risk_amount = follower_balance * (conservative_risk_percentage / 100.0)
+            
+            # Calculate quantity based on risk amount
+            quantity = risk_amount / mark_price
+            
+            logger.info(f"📊 Balance-proportional calculation:")
+            logger.info(f"   Conservative risk: ${risk_amount:.2f} ({conservative_risk_percentage}% of ${follower_balance:.2f})")
+            logger.info(f"   Calculated quantity: {quantity}")
+            
+            return quantity
+            
+        except Exception as e:
+            logger.error(f"Error in balance-proportional calculation: {e}")
+            return 0
+    
+    async def apply_safety_limits(self, quantity: float, follower_balance: float, mark_price: float, follower_account, master_trade: Trade) -> float:
+        """Apply safety limits to prevent excessive risk"""
+        try:
+            original_quantity = quantity
+            
+            # 1. Maximum position size: 20% of balance (conservative limit)
+            max_position_value = follower_balance * 0.20  # 20% max
+            max_quantity_by_balance = max_position_value / mark_price
+            
+            if quantity > max_quantity_by_balance:
+                logger.warning(f"⚠️ Quantity reduced by balance limit: {quantity} -> {max_quantity_by_balance}")
+                quantity = max_quantity_by_balance
+            
+            # 2. Maximum leverage check: prevent over-leveraging
+            position_value = quantity * mark_price
+            effective_leverage = position_value / follower_balance
+            max_allowed_leverage = follower_account.leverage * 0.8  # Use 80% of max leverage
+            
+            if effective_leverage > max_allowed_leverage:
+                safe_quantity = (follower_balance * max_allowed_leverage) / mark_price
+                logger.warning(f"⚠️ Quantity reduced by leverage limit: {quantity} -> {safe_quantity}")
+                logger.warning(f"   Effective leverage would be {effective_leverage:.1f}x, max allowed: {max_allowed_leverage:.1f}x")
+                quantity = safe_quantity
+            
+            # 3. Minimum position size (Binance minimum notional: $5)
+            min_notional = 5.0
+            min_quantity = min_notional / mark_price
+            
+            if quantity < min_quantity:
+                logger.warning(f"⚠️ Quantity below minimum notional: {quantity} -> {min_quantity}")
+                quantity = min_quantity
+            
+            # 4. Maximum single trade risk: 10% of balance
+            max_risk_value = follower_balance * 0.10  # 10% max risk per trade
+            max_quantity_by_risk = max_risk_value / mark_price
+            
+            if quantity > max_quantity_by_risk:
+                logger.warning(f"⚠️ Quantity reduced by risk limit: {quantity} -> {max_quantity_by_risk}")
+                quantity = max_quantity_by_risk
+            
+            if quantity != original_quantity:
+                logger.info(f"📊 Safety limits applied: {original_quantity:.8f} -> {quantity:.8f}")
+            
+            return quantity
+            
+        except Exception as e:
+            logger.error(f"Error applying safety limits: {e}")
+            return quantity
+    
+    async def calculate_fallback_quantity(self, master_trade: Trade, config: CopyTradingConfig) -> float:
+        """Fallback calculation when balance-based sizing fails"""
+        try:
+            # Conservative fallback: use copy percentage with reduced scaling
+            fallback_quantity = master_trade.quantity * (config.copy_percentage / 100.0) * 0.5  # 50% reduction for safety
+            fallback_quantity = round(fallback_quantity, 8)
+            
+            logger.warning(f"⚠️ Using fallback quantity calculation: {fallback_quantity}")
+            logger.warning(f"   Master quantity: {master_trade.quantity}, Copy%: {config.copy_percentage}%, Safety reduction: 50%")
+            
             return fallback_quantity
+            
+        except Exception as e:
+            logger.error(f"Error in fallback calculation: {e}")
+            return 0
+    
+    async def get_portfolio_risk(self, follower_client: BinanceClient, follower_balance: float) -> float:
+        """Calculate current portfolio risk percentage"""
+        try:
+            positions = await follower_client.get_positions()
+            total_position_value = 0
+            
+            for position in positions:
+                if position.get('size', 0) != 0:  # Only count open positions
+                    position_value = abs(float(position.get('size', 0))) * float(position.get('markPrice', 0))
+                    total_position_value += position_value
+            
+            portfolio_risk_percentage = (total_position_value / follower_balance) * 100 if follower_balance > 0 else 0
+            
+            logger.info(f"📊 Portfolio risk: ${total_position_value:.2f} ({portfolio_risk_percentage:.1f}% of balance)")
+            
+            return portfolio_risk_percentage
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Could not calculate portfolio risk: {e}")
+            return 0
     
     async def place_follower_trade(self, master_trade: Trade, config: CopyTradingConfig, quantity: float, session: Session):
         """Place the trade on follower account"""
