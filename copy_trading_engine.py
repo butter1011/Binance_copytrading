@@ -551,6 +551,15 @@ class CopyTradingEngine:
             if order_time < self.server_start_time:
                 logger.info(f"🛡️ STARTUP PROTECTION: Skipping order {order_id} from {order_time} (before server start {self.server_start_time})")
                 return
+            
+            # ADDITIONAL PROTECTION: Skip cancelled orders that are more than 2 minutes old
+            if order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
+                two_minutes_ago = datetime.utcnow() - timedelta(minutes=2)
+                if order_time < two_minutes_ago:
+                    logger.info(f"🛡️ CANCELLED ORDER FILTER: Skipping old cancelled order {order_id} from {order_time} (older than 2 minutes)")
+                    return
+                else:
+                    logger.info(f"⚠️ Processing recent cancelled order {order_id} from {order_time}")
             else:
                 logger.info(f"✅ Order {order_id} is after server startup - processing")
             
