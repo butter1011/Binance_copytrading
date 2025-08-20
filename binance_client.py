@@ -268,6 +268,8 @@ class BinanceClient:
             import asyncio
             loop = asyncio.get_event_loop()
             
+            logger.info(f"🔄 Starting market order placement for {symbol}")
+            
             # Check position mode to determine if we need positionSide
             is_hedge_mode = await self.get_position_mode()
             
@@ -287,14 +289,33 @@ class BinanceClient:
             else:
                 logger.info("One-way mode detected - no positionSide needed")
             
+            logger.info(f"📋 Order parameters: {order_params}")
+            
+            # Place the order
+            logger.info(f"🚀 Executing futures_create_order...")
             order = await loop.run_in_executor(None, lambda: self.client.futures_create_order(**order_params))
-            logger.info(f"Market order placed: {symbol} {side} {quantity}")
-            return order
+            
+            if order:
+                logger.info(f"✅ Market order placed successfully: {symbol} {side} {quantity}")
+                logger.info(f"📋 Order response: {order}")
+                return order
+            else:
+                logger.error(f"❌ Order placement returned None response!")
+                raise Exception("Order placement returned None")
+                
+        except BinanceAPIException as e:
+            logger.error(f"❌ Binance API Exception: {e}")
+            logger.error(f"❌ Error code: {e.code}")
+            logger.error(f"❌ Error message: {e.message}")
+            raise
         except BinanceOrderException as e:
-            logger.error(f"Order placement failed: {e}")
+            logger.error(f"❌ Binance Order Exception: {e}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error placing order: {e}")
+            logger.error(f"❌ Unexpected error placing market order: {e}")
+            logger.error(f"❌ Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"❌ Full traceback: {traceback.format_exc()}")
             raise
     
     async def place_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Dict:
@@ -302,6 +323,8 @@ class BinanceClient:
         try:
             import asyncio
             loop = asyncio.get_event_loop()
+            
+            logger.info(f"🔄 Starting limit order placement for {symbol}")
             
             # Check position mode to determine if we need positionSide
             is_hedge_mode = await self.get_position_mode()
@@ -324,14 +347,33 @@ class BinanceClient:
             else:
                 logger.info("One-way mode detected - no positionSide needed")
             
+            logger.info(f"📋 Order parameters: {order_params}")
+            
+            # Place the order
+            logger.info(f"🚀 Executing futures_create_order...")
             order = await loop.run_in_executor(None, lambda: self.client.futures_create_order(**order_params))
-            logger.info(f"Limit order placed: {symbol} {side} {quantity} @ {price}")
-            return order
+            
+            if order:
+                logger.info(f"✅ Limit order placed successfully: {symbol} {side} {quantity} @ {price}")
+                logger.info(f"📋 Order response: {order}")
+                return order
+            else:
+                logger.error(f"❌ Order placement returned None response!")
+                raise Exception("Order placement returned None")
+                
+        except BinanceAPIException as e:
+            logger.error(f"❌ Binance API Exception: {e}")
+            logger.error(f"❌ Error code: {e.code}")
+            logger.error(f"❌ Error message: {e.message}")
+            raise
         except BinanceOrderException as e:
-            logger.error(f"Order placement failed: {e}")
+            logger.error(f"❌ Binance Order Exception: {e}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error placing order: {e}")
+            logger.error(f"❌ Unexpected error placing limit order: {e}")
+            logger.error(f"❌ Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"❌ Full traceback: {traceback.format_exc()}")
             raise
     
     async def place_stop_market_order(self, symbol: str, side: str, quantity: float, stop_price: float) -> Dict:

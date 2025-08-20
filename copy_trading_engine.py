@@ -991,6 +991,18 @@ class CopyTradingEngine:
     async def place_follower_trade(self, master_trade: Trade, config: CopyTradingConfig, quantity: float, session: Session):
         """Place the trade on follower account"""
         try:
+            logger.info(f"🔄 Starting follower trade placement process...")
+            logger.info(f"📋 Master trade details:")
+            logger.info(f"   Symbol: {master_trade.symbol}")
+            logger.info(f"   Side: {master_trade.side}")
+            logger.info(f"   Order Type: {master_trade.order_type}")
+            logger.info(f"   Master Quantity: {master_trade.quantity}")
+            logger.info(f"   Follower Quantity: {quantity}")
+            logger.info(f"   Price: {master_trade.price}")
+            logger.info(f"   Stop Price: {master_trade.stop_price}")
+            logger.info(f"   Take Profit Price: {master_trade.take_profit_price}")
+            logger.info(f"📋 Copy config: {config.follower_account_id} -> {config.copy_percentage}%")
+            
             follower_client = self.follower_clients[config.follower_account_id]
             
             # Set leverage and position mode if needed (handle subaccount limitations)
@@ -1066,38 +1078,68 @@ class CopyTradingEngine:
                 logger.info(f"💰 Order notional value: ${notional_value:.2f}")
             
             # Place the order based on order type
-            if master_trade.order_type == "MARKET":
-                order = await follower_client.place_market_order(
-                    master_trade.symbol,
-                    master_trade.side,
-                    quantity
-                )
-            elif master_trade.order_type == "LIMIT":
-                order = await follower_client.place_limit_order(
-                    master_trade.symbol,
-                    master_trade.side,
-                    quantity,
-                    master_trade.price
-                )
-            elif master_trade.order_type == "STOP_MARKET":
-                order = await follower_client.place_stop_market_order(
-                    master_trade.symbol,
-                    master_trade.side,
-                    quantity,
-                    master_trade.stop_price
-                )
-            elif master_trade.order_type == "TAKE_PROFIT_MARKET":
-                order = await follower_client.place_take_profit_market_order(
-                    master_trade.symbol,
-                    master_trade.side,
-                    quantity,
-                    master_trade.take_profit_price
-                )
-            else:
-                logger.warning(f"Unsupported order type: {master_trade.order_type}")
-                return False
+            logger.info(f"🔄 Attempting to place {master_trade.order_type} order...")
+            order = None
             
-            logger.info(f"✅ Follower order placed successfully: Order ID {order.get('orderId', 'Unknown')}")
+            try:
+                if master_trade.order_type == "MARKET":
+                    logger.info(f"📊 Placing MARKET order: {master_trade.symbol} {master_trade.side} {quantity}")
+                    order = await follower_client.place_market_order(
+                        master_trade.symbol,
+                        master_trade.side,
+                        quantity
+                    )
+                elif master_trade.order_type == "LIMIT":
+                    # Validate price for LIMIT orders
+                    if not master_trade.price or master_trade.price <= 0:
+                        logger.error(f"❌ Invalid price for LIMIT order: {master_trade.price}")
+                        logger.error(f"❌ LIMIT orders require a valid positive price")
+                        return False
+                    
+                    logger.info(f"📊 Placing LIMIT order: {master_trade.symbol} {master_trade.side} {quantity} @ {master_trade.price}")
+                    order = await follower_client.place_limit_order(
+                        master_trade.symbol,
+                        master_trade.side,
+                        quantity,
+                        master_trade.price
+                    )
+                elif master_trade.order_type == "STOP_MARKET":
+                    logger.info(f"📊 Placing STOP_MARKET order: {master_trade.symbol} {master_trade.side} {quantity} @ {master_trade.stop_price}")
+                    order = await follower_client.place_stop_market_order(
+                        master_trade.symbol,
+                        master_trade.side,
+                        quantity,
+                        master_trade.stop_price
+                    )
+                elif master_trade.order_type == "TAKE_PROFIT_MARKET":
+                    logger.info(f"📊 Placing TAKE_PROFIT_MARKET order: {master_trade.symbol} {master_trade.side} {quantity} @ {master_trade.take_profit_price}")
+                    order = await follower_client.place_take_profit_market_order(
+                        master_trade.symbol,
+                        master_trade.side,
+                        quantity,
+                        master_trade.take_profit_price
+                    )
+                else:
+                    logger.warning(f"❌ Unsupported order type: {master_trade.order_type}")
+                    return False
+                
+                if order:
+                    logger.info(f"✅ Follower order placed successfully!")
+                    logger.info(f"📋 Order details: Order ID {order.get('orderId', 'Unknown')}")
+                    logger.info(f"📋 Order status: {order.get('status', 'Unknown')}")
+                    logger.info(f"📋 Full order response: {order}")
+                else:
+                    logger.error(f"❌ Order placement returned None - this should not happen!")
+                    return False
+                    
+            except Exception as order_error:
+                logger.error(f"❌ CRITICAL: Order placement failed with exception: {order_error}")
+                logger.error(f"❌ Order type: {master_trade.order_type}")
+                logger.error(f"❌ Symbol: {master_trade.symbol}")
+                logger.error(f"❌ Side: {master_trade.side}")
+                logger.error(f"❌ Quantity: {quantity}")
+                logger.error(f"❌ Price: {master_trade.price}")
+                raise order_error  # Re-raise to be caught by outer exception handler
             
             # Save follower trade to database
             follower_trade = Trade(
