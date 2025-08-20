@@ -454,6 +454,14 @@ class BinanceClient:
             result = self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
             logger.info(f"Order cancelled: {symbol} {order_id}")
             return True
+        except BinanceAPIException as e:
+            # Handle "Unknown order" as success since it means order was already cancelled/doesn't exist
+            if e.code == -2011:  # Unknown order sent
+                logger.info(f"Order {order_id} for {symbol} was already cancelled or doesn't exist")
+                return True
+            else:
+                logger.error(f"Failed to cancel order: {e}")
+                return False
         except Exception as e:
             logger.error(f"Failed to cancel order: {e}")
             return False

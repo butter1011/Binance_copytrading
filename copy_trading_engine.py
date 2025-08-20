@@ -417,6 +417,11 @@ class CopyTradingEngine:
                     lambda: client.client.futures_get_all_orders(startTime=effective_start_time, limit=50)
                 )
                 logger.info(f"📊 Retrieved {len(historical_orders)} historical orders from Binance (since {datetime.fromtimestamp(effective_start_time / 1000)})")
+                
+                # Debug log to show startup protection is working
+                if effective_start_time > start_time:
+                    logger.info(f"🛡️ Startup protection active: Limited from {datetime.fromtimestamp(start_time / 1000)} to {datetime.fromtimestamp(effective_start_time / 1000)}")
+                
                 all_orders.extend(historical_orders)
             except Exception as e:
                 logger.error(f"❌ Failed to get historical orders: {e}")
@@ -449,6 +454,15 @@ class CopyTradingEngine:
                 is_recently_cancelled = (order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and 
                                        order_time >= five_minutes_ago and 
                                        order_time >= server_start_time_ms)
+                
+                # Debug logging for cancelled orders that are being filtered out
+                if order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
+                    order_time_readable = datetime.fromtimestamp(order_time / 1000)
+                    server_start_readable = datetime.fromtimestamp(server_start_time_ms / 1000)
+                    if order_time < server_start_time_ms:
+                        logger.info(f"🛡️ FILTERED: Cancelled order {order_id} from {order_time_readable} (before server start {server_start_readable})")
+                    elif not is_recently_cancelled:
+                        logger.debug(f"🛡️ FILTERED: Old cancelled order {order_id} from {order_time_readable}")
                 
                 if (order_id not in seen_orders and 
                     order['side'] in ['BUY', 'SELL'] and 
@@ -516,6 +530,11 @@ class CopyTradingEngine:
             
             logger.info(f"🎯 Starting to process master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status} - Time: {order_time}")
             logger.info(f"🔍 Order details: ID={order_id}, ExecutedQty={executed_qty}, Type={order.get('type', 'UNKNOWN')}")
+            
+            # STARTUP PROTECTION: Skip orders from before server startup time
+            if order_time < self.server_start_time:
+                logger.info(f"🛡️ STARTUP PROTECTION: Skipping order {order_id} from {order_time} (before server start {self.server_start_time})")
+                return
             
             # Check if this order is from before restart (prevent duplicate processing)
             if master_id in self.last_processed_order_time:
