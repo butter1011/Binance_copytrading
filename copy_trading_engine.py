@@ -246,14 +246,21 @@ class CopyTradingEngine:
             logger.warning("Copy trading engine is already running")
             return
         
-        # Reset server start time to NOW when actually starting monitoring
-        self.server_start_time = datetime.utcnow()
-        logger.info(f"🕐 RESET: Server start time set to {self.server_start_time}")
-        logger.info(f"🕐 RESET: Server startup time (timestamp): {self.server_start_time.timestamp()}")
-        
-        # Clear startup completion flags to ensure startup protection is applied
-        self.startup_complete.clear()
-        logger.info(f"🧹 Cleared startup completion flags")
+        # FIXED: Only set server start time if this is the first time monitoring starts
+        # This prevents the uptime calculation issue where server_start_time gets reset
+        if not hasattr(self, '_monitoring_started_before') or not self._monitoring_started_before:
+            self.server_start_time = datetime.utcnow()
+            self._monitoring_started_before = True
+            logger.info(f"🕐 INITIAL START: Server start time set to {self.server_start_time}")
+            logger.info(f"🕐 Server startup time (timestamp): {self.server_start_time.timestamp()}")
+            
+            # Clear startup completion flags to ensure startup protection is applied
+            self.startup_complete.clear()
+            logger.info(f"🧹 Cleared startup completion flags")
+        else:
+            logger.info(f"🔄 RESTART: Keeping original server start time: {self.server_start_time}")
+            current_uptime = datetime.utcnow() - self.server_start_time
+            logger.info(f"🕐 Current server uptime: {current_uptime}")
         
         self.is_running = True
         logger.info("Starting copy trading monitoring...")
@@ -591,23 +598,23 @@ class CopyTradingEngine:
             # AGGRESSIVE PROTECTION: Only process very recent orders
             five_minutes_ago = datetime.utcnow() - timedelta(minutes=5)
             
-            # COMPLETE BLOCK: Do not process any cancelled orders during startup period
+            # IMPROVED CANCELLATION HANDLING: Process recent cancellations even during startup
             if order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
                 # Calculate how long the server has been running
                 server_uptime = datetime.utcnow() - self.server_start_time
+                logger.info(f"🕐 Server uptime: {server_uptime}")
                 
-                # Block ALL cancelled orders for the first 10 minutes after server startup
-                if server_uptime < timedelta(minutes=10):
-                    logger.info(f"🛡️ STARTUP BLOCK: Skipping cancelled order {order_id} from {order_time} (server uptime: {server_uptime})")
+                # Only process very recent cancelled orders (within last 2 minutes)
+                two_minutes_ago = datetime.utcnow() - timedelta(minutes=2)
+                if order_time < two_minutes_ago:
+                    logger.info(f"🛡️ OLD CANCELLED ORDER: Skipping cancelled order {order_id} from {order_time} (older than 2 minutes)")
                     return
                 
-                # After startup period, only process cancelled orders within 10 seconds
-                ten_seconds_ago = datetime.utcnow() - timedelta(seconds=10)
-                if order_time < ten_seconds_ago:
-                    logger.info(f"🛡️ CANCELLED ORDER FILTER: Skipping old cancelled order {order_id} from {order_time} (older than 10 seconds)")
-                    return
-                else:
-                    logger.info(f"⚠️ Processing very recent cancelled order {order_id} from {order_time}")
+                # Process recent cancellations to cancel follower orders
+                logger.info(f"🔄 PROCESSING RECENT CANCELLATION: {order_id} from {order_time} - will cancel follower orders")
+                
+                # For cancelled orders, we need to cancel corresponding follower orders
+                # Don't return here - let it process the cancellation
             
             # For NEW orders (most important), be more lenient - allow up to 10 minutes
             elif order_status in ['NEW', 'PARTIALLY_FILLED']:
@@ -716,8 +723,10 @@ class CopyTradingEngine:
                 quantity_to_record = executed_qty
                 price_to_record = float(order.get('avgPrice', order.get('price', 0)))
             elif order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
-                # Handle cancelled/expired orders - need to cancel follower orders
-                logger.info(f"🚫 Processing cancelled/expired order: {order_id} - Symbol: {order.get('symbol')} Side: {order.get('side')} Qty: {order.get('origQty')}")
+                # Handle cancelled/expired orders - MUST cancel follower orders
+                logger.info(f"🚫 PROCESSING MASTER ORDER CANCELLATION: {order_id}")
+                logger.info(f"📊 Order details: Symbol={order.get('symbol')}, Side={order.get('side')}, Qty={order.get('origQty')}, Type={order.get('type')}")
+                logger.info(f"🕐 Order time: {order_time}, Current time: {datetime.utcnow()}")
                 
                 # First, try to find existing master trade record for this order
                 existing_master_trade = session.query(Trade).filter(
@@ -726,25 +735,36 @@ class CopyTradingEngine:
                 ).first()
                 
                 if existing_master_trade:
-                    logger.info(f"📝 Found existing master trade {existing_master_trade.id} for cancelled order - Status: {existing_master_trade.status}")
+                    logger.info(f"✅ Found existing master trade {existing_master_trade.id} for cancelled order - Current status: {existing_master_trade.status}")
                     # Update the existing trade status
                     if existing_master_trade.status != 'CANCELLED':
                         existing_master_trade.status = 'CANCELLED'
                         session.commit()
                         logger.info(f"📝 Updated master trade {existing_master_trade.id} status to CANCELLED")
-                    # Handle follower cancellations using the existing trade
+                    
+                    # CRITICAL: Handle follower cancellations using the existing trade
+                    logger.info(f"🔄 Initiating follower order cancellations...")
                     await self.handle_master_order_cancellation_with_trade(existing_master_trade, session)
+                    logger.info(f"✅ Completed follower order cancellations for trade {existing_master_trade.id}")
                 else:
-                    logger.info(f"📝 No existing master trade found for cancelled order {order_id}")
+                    logger.info(f"⚠️ No existing master trade found for cancelled order {order_id}")
+                    logger.info(f"🤔 This could happen if:")
+                    logger.info(f"   1. Master order was cancelled before followers were created")
+                    logger.info(f"   2. Master order was cancelled very quickly after placement") 
+                    logger.info(f"   3. System was restarted and trade records were lost")
+                    
                     # Search for follower trades by order symbol, side, and time range
                     # This catches cases where the master order was cancelled before the trade record was created
                     logger.info(f"🔍 Searching for follower trades by order details: {order.get('symbol')} {order.get('side')} {order.get('origQty')}")
                     await self.handle_cancellation_by_order_details(master_id, order, session)
                     
+                    # Also search for recent follower orders that might be related
+                    await self.cancel_recent_follower_orders_by_pattern(master_id, order, session)
+                    
                     # Log the cancellation
                     self.add_system_log("INFO", f"🚫 Master order cancelled: {order.get('symbol')} {order.get('side')} {order_id}", master_id)
                 
-                logger.info(f"🔚 Completed processing cancelled order {order_id}")
+                logger.info(f"🔚 COMPLETED processing cancelled order {order_id}")
                 session.close()
                 return
             else:
@@ -1992,6 +2012,83 @@ class CopyTradingEngine:
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             session.rollback()
+    
+    async def cancel_recent_follower_orders_by_pattern(self, master_id: int, master_order: dict, session: Session):
+        """Cancel recent follower orders that match the master order pattern - backup cancellation method"""
+        try:
+            logger.info(f"🔍 BACKUP CANCELLATION: Searching for recent follower orders matching master order pattern")
+            
+            order_symbol = master_order.get('symbol')
+            order_side = master_order.get('side')
+            order_time = datetime.fromtimestamp(master_order.get('time', master_order.get('updateTime', 0)) / 1000)
+            
+            # Get copy trading configs for this master to find follower accounts
+            configs = session.query(CopyTradingConfig).filter(
+                CopyTradingConfig.master_account_id == master_id,
+                CopyTradingConfig.is_active == True
+            ).all()
+            
+            if not configs:
+                logger.info(f"ℹ️ No active follower configs found for master {master_id}")
+                return
+            
+            logger.info(f"🔍 Checking {len(configs)} follower accounts for recent orders to cancel")
+            
+            # Check each follower account for recent matching orders
+            cancelled_count = 0
+            for config in configs:
+                try:
+                    # Look for recent follower orders within 5 minutes of the master order
+                    time_window_start = order_time - timedelta(minutes=2)
+                    time_window_end = order_time + timedelta(minutes=3)
+                    
+                    recent_follower_orders = session.query(Trade).filter(
+                        Trade.account_id == config.follower_account_id,
+                        Trade.symbol == order_symbol,
+                        Trade.side == order_side,
+                        Trade.status.in_(['PENDING', 'PARTIALLY_FILLED']),
+                        Trade.created_at >= time_window_start,
+                        Trade.created_at <= time_window_end,
+                        Trade.copied_from_master == True
+                    ).all()
+                    
+                    if recent_follower_orders:
+                        logger.info(f"🎯 Found {len(recent_follower_orders)} recent follower orders to cancel for account {config.follower_account_id}")
+                        
+                        # Cancel each order
+                        for follower_order in recent_follower_orders:
+                            try:
+                                follower_client = self.follower_clients.get(config.follower_account_id)
+                                if follower_client and follower_order.binance_order_id:
+                                    success = await follower_client.cancel_order(
+                                        follower_order.symbol,
+                                        str(follower_order.binance_order_id)
+                                    )
+                                    
+                                    if success:
+                                        follower_order.status = 'CANCELLED'
+                                        session.commit()
+                                        cancelled_count += 1
+                                        logger.info(f"✅ BACKUP CANCEL: Cancelled follower order {follower_order.binance_order_id}")
+                                        self.add_system_log("INFO", f"🚫 Backup cancellation: {follower_order.symbol} order cancelled", config.follower_account_id, follower_order.id)
+                                    
+                            except Exception as cancel_error:
+                                logger.error(f"❌ Error in backup cancellation: {cancel_error}")
+                    else:
+                        logger.debug(f"ℹ️ No recent matching orders found for follower {config.follower_account_id}")
+                        
+                except Exception as follower_error:
+                    logger.error(f"❌ Error checking follower {config.follower_account_id}: {follower_error}")
+            
+            if cancelled_count > 0:
+                logger.info(f"✅ BACKUP CANCELLATION: Successfully cancelled {cancelled_count} follower orders")
+            else:
+                logger.info(f"ℹ️ BACKUP CANCELLATION: No additional follower orders found to cancel")
+                
+        except Exception as e:
+            logger.error(f"❌ Error in backup cancellation method: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
 
     async def handle_master_order_cancellation(self, master_id: int, master_order_id: str, session: Session):
         """Handle cancellation of master orders by cancelling corresponding follower orders (Legacy method)"""
