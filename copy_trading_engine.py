@@ -818,6 +818,42 @@ class CopyTradingEngine:
                 logger.warning(f"⚠️ Could not get follower balance or balance is zero")
                 return await self.calculate_fallback_quantity(master_trade, config)
             
+            # Get master balance
+            master_balance = 0
+            master_client = self.master_clients.get(master_trade.account_id)
+            if master_client:
+                try:
+                    master_balance = await master_client.get_balance()
+                    logger.info(f"📊 Got live master balance: ${master_balance:.2f}")
+                    
+                    # Update stored balance if it's significantly different
+                    if abs(master_balance - master_account.balance) > (master_account.balance * 0.05):  # 5% difference
+                        old_balance = master_account.balance
+                        master_account.balance = master_balance
+                        session = get_session()
+                        session.merge(master_account)
+                        session.commit()
+                        session.close()
+                        logger.info(f"📊 Updated master account balance: ${old_balance:.2f} → ${master_balance:.2f}")
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not get live master balance: {e}")
+                    master_balance = master_account.balance  # Use stored balance as fallback
+                    logger.info(f"📊 Using stored master balance: ${master_balance:.2f}")
+            else:
+                master_balance = master_account.balance  # Use stored balance
+                logger.info(f"📊 Using stored master balance (no client): ${master_balance:.2f}")
+            
+            # Update follower balance in database if significantly different
+            if abs(follower_balance - follower_account.balance) > (follower_account.balance * 0.05):  # 5% difference
+                old_balance = follower_account.balance
+                follower_account.balance = follower_balance
+                session = get_session()
+                session.merge(follower_account)
+                session.commit()
+                session.close()
+                logger.info(f"📊 Updated follower account balance: ${old_balance:.2f} → ${follower_balance:.2f}")
+            
             # Get mark price for the symbol
             try:
                 mark_price = await follower_client.get_mark_price(master_trade.symbol)
@@ -826,20 +862,27 @@ class CopyTradingEngine:
             except Exception:
                 mark_price = master_trade.price if master_trade.price > 0 else 1.0
             
-            logger.info(f"📊 Risk-based calculation starting:")
+            logger.info(f"📊 Position sizing calculation starting:")
+            logger.info(f"   Master balance: ${master_balance:.2f}")
             logger.info(f"   Follower balance: ${follower_balance:.2f}")
             logger.info(f"   Follower risk%: {follower_account.risk_percentage}%")
             logger.info(f"   Follower leverage: {follower_account.leverage}x")
             logger.info(f"   Symbol price: ${mark_price:.4f}")
             
-            # OPTION 1: Risk-Based Position Sizing (Recommended)
-            if follower_account.risk_percentage > 0:
+            # OPTION 1: Balance Ratio Position Sizing (Primary method - maintains proportional risk)
+            if master_balance > 0 and follower_balance > 0:
+                quantity = await self.calculate_balance_ratio_quantity(
+                    master_trade, master_balance, follower_balance, mark_price, config
+                )
+                logger.info(f"📊 Using balance-ratio sizing: {quantity}")
+            # OPTION 2: Risk-Based Position Sizing (Fallback)
+            elif follower_account.risk_percentage > 0:
                 quantity = await self.calculate_risk_based_quantity(
                     follower_balance, follower_account, mark_price, master_trade, config
                 )
                 logger.info(f"📊 Using risk-based sizing: {quantity}")
             else:
-                # OPTION 2: Fallback to balance-proportional sizing
+                # OPTION 3: Balance-proportional sizing (Final fallback)
                 quantity = await self.calculate_balance_proportional_quantity(
                     follower_balance, mark_price, master_trade, config
                 )
@@ -925,6 +968,39 @@ class CopyTradingEngine:
             
         except Exception as e:
             logger.error(f"Error in balance-proportional calculation: {e}")
+            return 0
+    
+    async def calculate_balance_ratio_quantity(self, master_trade: Trade, master_balance: float, follower_balance: float, mark_price: float, config: CopyTradingConfig) -> float:
+        """Calculate position size based on balance ratio between master and follower accounts"""
+        try:
+            # Calculate the ratio of follower balance to master balance
+            balance_ratio = follower_balance / master_balance
+            
+            # Calculate master trade's notional value
+            master_price = master_trade.price if master_trade.price > 0 else mark_price
+            master_notional = master_trade.quantity * master_price
+            
+            # Calculate master's risk percentage on this trade
+            master_risk_percentage = (master_notional / master_balance) * 100 if master_balance > 0 else 0
+            
+            # Scale the quantity based on balance ratio, maintaining similar risk percentage
+            # This ensures follower takes proportionally similar risk as master
+            follower_notional = master_notional * balance_ratio
+            quantity = follower_notional / mark_price
+            
+            logger.info(f"📊 Balance-ratio calculation:")
+            logger.info(f"   Master balance: ${master_balance:.2f}")
+            logger.info(f"   Follower balance: ${follower_balance:.2f}")
+            logger.info(f"   Balance ratio: {balance_ratio:.4f}")
+            logger.info(f"   Master notional: ${master_notional:.2f}")
+            logger.info(f"   Master risk %: {master_risk_percentage:.2f}%")
+            logger.info(f"   Follower notional: ${follower_notional:.2f}")
+            logger.info(f"   Calculated quantity: {quantity}")
+            
+            return quantity
+            
+        except Exception as e:
+            logger.error(f"Error in balance-ratio calculation: {e}")
             return 0
     
     async def apply_safety_limits(self, quantity: float, follower_balance: float, mark_price: float, follower_account, master_trade: Trade) -> float:
