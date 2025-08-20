@@ -522,16 +522,31 @@ class CopyTradingEngine:
                             existing_trade.status = 'CANCELLED'
                             session_check.commit()
                             await self.handle_master_order_cancellation_with_trade(existing_trade, session_check)
-                            session_check.close()
+                        session_check.close()
                         return
                     else:
-                        logger.warning(f"🔄 Order {order_id} NOT in database - reprocessing...")
-                        # Remove from processed set so we can reprocess
-                        self.processed_orders[master_id].discard(order_id)
+                        # Check if this is a cancelled order that was never saved to database
+                        if order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
+                            logger.info(f"✅ Order {order_id} is cancelled and not in database - this is expected, skipping")
+                            session_check.close()
+                            return
+                        else:
+                            logger.warning(f"🔄 Order {order_id} NOT in database - reprocessing...")
+                            # Remove from processed set so we can reprocess
+                            self.processed_orders[master_id].discard(order_id)
                         
                 except Exception as db_error:
                     logger.error(f"❌ Database check failed for order {order_id}: {db_error}")
-                    # Continue processing the order despite database check failure
+                    # For cancelled orders, just skip if database check fails
+                    if order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
+                        logger.info(f"✅ Cancelled order {order_id} - skipping due to database error")
+                        if session_check:
+                            try:
+                                session_check.close()
+                            except:
+                                pass
+                        return
+                    # Continue processing the order despite database check failure for other statuses
                     self.processed_orders[master_id].discard(order_id)
                 finally:
                     if session_check:
@@ -542,10 +557,12 @@ class CopyTradingEngine:
             
             logger.info(f"📋 Processing NEW master order: {order['symbol']} {order['side']} {original_qty} - Status: {order_status}")
             
-            # Mark this order as processed (with cleanup to prevent memory leaks)
-            self.processed_orders[master_id].add(order_id)
-            logger.debug(f"✔️ Marked order {order_id} as processed")
+            # Create trade record in database first
+            logger.info(f"💾 Creating database session...")
+            session = get_session()
+            logger.info(f"💾 Database session created successfully")
             
+            # Mark this order as processed ONLY after successful database operation
             # Clean up old processed orders to prevent memory leaks (keep only last 1000)
             if len(self.processed_orders[master_id]) > 1000:
                 # Convert to list, sort by order_id (assuming newer orders have higher IDs)
@@ -553,11 +570,6 @@ class CopyTradingEngine:
                 # Keep only the most recent 500 orders
                 self.processed_orders[master_id] = set(sorted_orders[-500:])
                 logger.debug(f"🧹 Cleaned up processed orders for master {master_id}")
-            
-            # Create trade record in database
-            logger.info(f"💾 Creating database session...")
-            session = get_session()
-            logger.info(f"💾 Database session created successfully")
             
             # Log master trade detection
             self.add_system_log("INFO", f"🔍 Master trade detected: {order.get('symbol')} {order.get('side')} {executed_qty} (Status: {order_status})", master_id)
@@ -596,6 +608,24 @@ class CopyTradingEngine:
                     await self.handle_master_order_cancellation_with_trade(existing_master_trade, session)
                 else:
                     logger.info(f"📝 No existing master trade found for cancelled order {order_id}")
+                    
+                    # Create a cancelled trade record to prevent reprocessing
+                    cancelled_trade = Trade(
+                        account_id=master_id,
+                        symbol=order['symbol'],
+                        side=order['side'],
+                        order_type=order['type'],
+                        quantity=float(order.get('origQty', 0)),
+                        price=float(order.get('price', 0)),
+                        status='CANCELLED',
+                        binance_order_id=str(order['orderId']),
+                        copied_from_master=False
+                    )
+                    
+                    session.add(cancelled_trade)
+                    session.commit()
+                    logger.info(f"💾 Created cancelled trade record {cancelled_trade.id} to prevent reprocessing")
+                    
                     # Search for follower trades by order symbol, side, and time range
                     # This catches cases where the master order was cancelled before the trade record was created
                     logger.info(f"🔍 Searching for follower trades by order details: {order.get('symbol')} {order.get('side')} {order.get('origQty')}")
@@ -685,6 +715,11 @@ class CopyTradingEngine:
             
             logger.info(f"🔒 Closing database session...")
             session.close()
+            
+            # Mark order as processed ONLY after successful database commit
+            self.processed_orders[master_id].add(order_id)
+            logger.debug(f"✔️ Marked order {order_id} as processed after successful database operation")
+            
             logger.info(f"✅ Master order {order_id} processed completely")
             
         except Exception as e:
