@@ -28,6 +28,7 @@ class CopyTradingEngine:
         self.last_trade_check = {}
         self.processed_orders = {}  # account_id -> set of order_ids to avoid duplicates
         self.last_processed_order_time = {}  # account_id -> datetime to avoid processing old orders on restart
+        self.startup_complete = {}  # account_id -> bool to track if startup processing is complete
         logger.info("🏗️ CopyTradingEngine initialized")
         
     async def initialize(self):
@@ -254,6 +255,9 @@ class CopyTradingEngine:
             # Initialize processed orders tracking for this master
             if master_id not in self.processed_orders:
                 self.processed_orders[master_id] = set()
+            # Initialize startup tracking
+            if master_id not in self.startup_complete:
+                self.startup_complete[master_id] = False
         
         logger.info(f"Started monitoring {len(self.master_clients)} master accounts")
     
@@ -311,12 +315,24 @@ class CopyTradingEngine:
             # Get the last trade timestamp for this master
             last_check = self.last_trade_check.get(master_id, datetime.utcnow() - timedelta(hours=1))
             
+            # STARTUP PROTECTION: On first run, only look at very recent orders to avoid processing old cancelled orders
+            if master_id not in self.startup_complete:
+                logger.info(f"🚀 First run for master {master_id} - only processing very recent orders (last 2 minutes)")
+                # For first run, only look at orders from the last 2 minutes
+                startup_time = datetime.utcnow() - timedelta(minutes=2)
+                effective_last_check = max(last_check, startup_time)
+                logger.info(f"📅 Adjusted time window: {last_check} -> {effective_last_check}")
+                # Mark startup as complete after first check
+                self.startup_complete[master_id] = True
+            else:
+                effective_last_check = last_check
+            
             # Get recent trades from Binance API directly
-            logger.debug(f"Checking trades for master {master_id} since {last_check}")
+            logger.debug(f"Checking trades for master {master_id} since {effective_last_check}")
             
             try:
                 # Get recent orders from Binance
-                recent_orders = await self.get_recent_orders(client, last_check)
+                recent_orders = await self.get_recent_orders(client, effective_last_check)
                 
                 if recent_orders:
                     logger.info(f"Found {len(recent_orders)} recent orders for master {master_id}")
@@ -382,13 +398,18 @@ class CopyTradingEngine:
             except Exception as e:
                 logger.warning(f"⚠️ Failed to get open orders: {e}")
             
-            # 2. Get recent historical orders
+            # 2. Get recent historical orders - REDUCED TIME WINDOW to prevent processing old orders
             try:
+                # Use a much shorter time window to avoid processing old cancelled orders
+                # Only look back 10 minutes instead of the full time since last check
+                ten_minutes_ago = int((datetime.utcnow() - timedelta(minutes=10)).timestamp() * 1000)
+                effective_start_time = max(start_time, ten_minutes_ago)
+                
                 historical_orders = await loop.run_in_executor(
                     None, 
-                    lambda: client.client.futures_get_all_orders(startTime=start_time, limit=100)
+                    lambda: client.client.futures_get_all_orders(startTime=effective_start_time, limit=50)
                 )
-                logger.info(f"📊 Retrieved {len(historical_orders)} historical orders from Binance")
+                logger.info(f"📊 Retrieved {len(historical_orders)} historical orders from Binance (since {datetime.fromtimestamp(effective_start_time / 1000)})")
                 all_orders.extend(historical_orders)
             except Exception as e:
                 logger.error(f"❌ Failed to get historical orders: {e}")
@@ -409,51 +430,44 @@ class CopyTradingEngine:
                     logger.warning(f"⚠️ Order {order_id} has invalid future timestamp: {order_time}, using current time")
                     order_time = current_time_ms
                 
-                # Include orders if:
-                # 1. They are open orders (NEW/PARTIALLY_FILLED) - regardless of time
-                # 2. They are recent filled orders (within time range)
-                # 3. They are recent cancelled/expired orders (need to cancel followers)
-                # 4. ANY filled orders in the last 5 minutes to catch fast-filling orders
+                # STRICT FILTERING: Only process orders that are:
+                # 1. Open orders (NEW/PARTIALLY_FILLED) - regardless of time
+                # 2. Very recent filled orders (within last 5 minutes)
+                # 3. Very recent cancelled orders (within last 5 minutes) - only if we have active followers
                 is_open_order = order_status in ['NEW', 'PARTIALLY_FILLED']
-                is_recent_filled = order_status == 'FILLED' and order_time >= start_time
-                # EXTENDED WINDOW: Also catch FILLED orders from last 5 minutes to handle fast execution
                 five_minutes_ago = int((datetime.utcnow() - timedelta(minutes=5)).timestamp() * 1000)
                 is_recently_filled = order_status == 'FILLED' and order_time >= five_minutes_ago
-                # For cancelled orders, process recent ones (within normal time range) to handle follower cancellations
-                is_recent_cancelled = order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and order_time >= start_time
+                is_recently_cancelled = order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and order_time >= five_minutes_ago
                 
                 if (order_id not in seen_orders and 
                     order['side'] in ['BUY', 'SELL'] and 
                     order_status in ['NEW', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and
-                    (is_open_order or is_recent_filled or is_recently_filled or is_recent_cancelled)):
+                    (is_open_order or is_recently_filled or is_recently_cancelled)):
                     seen_orders.add(order_id)
                     relevant_orders.append(order)
                     if is_open_order:
                         status_note = "📋 OPEN"
-                    elif is_recent_cancelled:
-                        status_note = "❌ CANCELLED"
+                    elif is_recently_cancelled:
+                        status_note = "❌ RECENTLY CANCELLED"
                     elif is_recently_filled:
-                        status_note = "🏁 FILLED (Extended Window)"
+                        status_note = "🏁 RECENTLY FILLED"
                     else:
                         status_note = "🏁 RECENT"
                     # Fix timestamp display for logging
                     timestamp_display = datetime.fromtimestamp(order_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
                     logger.info(f"🎯 Found order {status_note}: {order['symbol']} {order['side']} {order['origQty']} - Status: {order_status} - Time: {timestamp_display}")
                 else:
-                    # Log why orders are being filtered out
+                    # Log why orders are being filtered out (only for debug level)
                     if order_id in seen_orders:
                         logger.debug(f"⏭️ Skipping duplicate order: {order_id}")
                     elif order['side'] not in ['BUY', 'SELL']:
                         logger.debug(f"⏭️ Skipping non-trading order: {order_id} (side: {order['side']})")
-                    elif order_status not in ['NEW', 'PARTIALLY_FILLED', 'FILLED']:
-                        logger.debug(f"⏭️ Skipping order with status: {order_id} (status: {order_status})")
-                    elif not (is_open_order or is_recent_filled or is_recently_filled):
+                    elif not (is_open_order or is_recently_filled or is_recently_cancelled):
                         timestamp_display = datetime.fromtimestamp(order_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
-                        start_time_display = datetime.fromtimestamp(start_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
                         five_min_display = datetime.fromtimestamp(five_minutes_ago / 1000).strftime('%Y-%m-%d %H:%M:%S')
-                        logger.debug(f"⏭️ Skipping old order: {order_id} (time: {timestamp_display}, normal threshold: {start_time_display}, extended threshold: {five_min_display})")
+                        logger.debug(f"⏭️ Skipping old order: {order_id} (time: {timestamp_display}, threshold: {five_min_display})")
             
-            logger.info(f"✅ Found {len(relevant_orders)} relevant orders (open + filled)")
+            logger.info(f"✅ Found {len(relevant_orders)} relevant orders (open + recent)")
             return relevant_orders
             
         except Exception as e:
