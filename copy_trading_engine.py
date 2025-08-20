@@ -791,9 +791,15 @@ class CopyTradingEngine:
                     else:
                         logger.info(f"🎯 FILLED order was not copied as NEW - copying now (this handles fast-filling orders)")
                 
-                # Check if this is a position closing order (reduceOnly = True or opposite direction trade)
-                if await self.is_position_closing_order(master_id, db_trade, session):
-                    logger.info(f"🔄 Detected position closing order - closing follower positions")
+                # ENHANCED: Check if this is a position closing order with multiple detection methods
+                is_reduce_only = order.get('reduceOnly', False)
+                is_position_closing = await self.is_position_closing_order(master_id, db_trade, session)
+                
+                if is_reduce_only:
+                    logger.info(f"🔄 REDUCE_ONLY flag detected - closing follower positions")
+                    await self.close_follower_positions(db_trade, session)
+                elif is_position_closing:
+                    logger.info(f"🔄 Position closing detected via analysis - closing follower positions")
                     await self.close_follower_positions(db_trade, session)
                 else:
                     logger.info(f"📈 Regular trade order - copying to followers")
@@ -811,9 +817,15 @@ class CopyTradingEngine:
                 if not existing_copy:
                     logger.info(f"🚀 Copying partially filled order to followers")
                     
-                    # Check if this is a position closing order
-                    if await self.is_position_closing_order(master_id, db_trade, session):
-                        logger.info(f"🔄 Detected position closing order - closing follower positions")
+                    # ENHANCED: Check if this is a position closing order with multiple detection methods
+                    is_reduce_only = order.get('reduceOnly', False)
+                    is_position_closing = await self.is_position_closing_order(master_id, db_trade, session)
+                    
+                    if is_reduce_only:
+                        logger.info(f"🔄 REDUCE_ONLY flag detected - closing follower positions")
+                        await self.close_follower_positions(db_trade, session)
+                    elif is_position_closing:
+                        logger.info(f"🔄 Position closing detected via analysis - closing follower positions")
                         await self.close_follower_positions(db_trade, session)
                     else:
                         logger.info(f"📈 Regular trade order - copying to followers")
@@ -1558,34 +1570,51 @@ class CopyTradingEngine:
             logger.error(f"Error adding account: {e}")
     
     async def is_position_closing_order(self, master_id: int, trade: Trade, session: Session) -> bool:
-        """Determine if this trade is closing an existing position"""
+        """Determine if this trade is closing an existing position - IMPROVED DETECTION"""
         try:
+            logger.info(f"🔍 Analyzing if order is position closing: {trade.symbol} {trade.side} {trade.quantity}")
+            
             # Get master account client to check positions
             master_client = self.master_clients.get(master_id)
             if not master_client:
                 logger.warning(f"⚠️ Master client not found for position check: {master_id}")
                 return False
             
-            # Get current positions from Binance API
-            positions = await master_client.get_positions()
+            # STEP 1: Check current positions from Binance API
+            positions = []
+            try:
+                positions = await master_client.get_positions()
+                logger.info(f"📊 Retrieved {len(positions)} current positions from Binance")
+            except Exception as pos_error:
+                logger.warning(f"⚠️ Failed to get current positions, using database fallback: {pos_error}")
             
-            # Check if there's an existing position in the opposite direction
+            # STEP 2: Check current positions for direct closing detection
             for position in positions:
                 if position['symbol'] == trade.symbol:
+                    logger.info(f"📊 Found position: {position['symbol']} {position['side']} size={position['size']}")
                     # If we have a LONG position and the trade is SELL, it's closing
                     # If we have a SHORT position and the trade is BUY, it's closing
                     if (position['side'] == 'LONG' and trade.side == 'SELL') or \
                        (position['side'] == 'SHORT' and trade.side == 'BUY'):
-                        logger.info(f"🔄 Position closing detected: {trade.symbol} {position['side']} position, {trade.side} order")
+                        logger.info(f"🔄 DIRECT POSITION CLOSING: {trade.symbol} {position['side']} position (size: {position['size']}), {trade.side} order (qty: {trade.quantity})")
                         return True
+                    else:
+                        logger.info(f"📈 Same direction trade: {position['side']} position, {trade.side} order (position building)")
             
-            # Also check database for recent opposite trades that might have created positions
+            if positions:
+                logger.info(f"ℹ️ No {trade.symbol} position found in current positions, checking trade history...")
+            
+            # STEP 3: Analyze recent trade history to detect position closing
+            logger.info(f"🔍 Analyzing trade history for position detection...")
             recent_trades = session.query(Trade).filter(
                 Trade.account_id == master_id,
                 Trade.symbol == trade.symbol,
-                Trade.status == 'FILLED',
-                Trade.created_at >= datetime.utcnow() - timedelta(hours=24)  # Last 24 hours
-            ).order_by(Trade.created_at.desc()).limit(10).all()
+                Trade.status.in_(['FILLED', 'PARTIALLY_FILLED']),
+                Trade.created_at >= datetime.utcnow() - timedelta(hours=24),  # Last 24 hours
+                Trade.id != trade.id  # Exclude the current trade we're analyzing
+            ).order_by(Trade.created_at.desc()).limit(20).all()
+            
+            logger.info(f"📚 Found {len(recent_trades)} recent trades for analysis")
             
             # Simple heuristic: if the most recent trades were in opposite direction, this might be closing
             opposite_side = 'BUY' if trade.side == 'SELL' else 'SELL'
@@ -1596,21 +1625,66 @@ class CopyTradingEngine:
                 same_side_trades = [t for t in recent_trades if t.side == trade.side]
                 total_same_qty = sum(t.quantity for t in same_side_trades)
                 
+                # IMPROVED LOGIC: Calculate net position more accurately
+                net_position = 0
+                for t in recent_trades:
+                    if t.side == 'BUY':
+                        net_position += t.quantity
+                    else:  # SELL
+                        net_position -= t.quantity
+                
+                logger.info(f"📊 Position analysis: Net={net_position}, Opposite trades={total_opposite_qty}, Same side={total_same_qty}")
+                
+                # ENHANCED HEURISTIC: If net position is opposite to current trade direction, it's likely closing
+                if net_position > 0 and trade.side == 'SELL':
+                    logger.info(f"🔄 POSITION CLOSING: Net LONG position {net_position}, SELL order {trade.quantity}")
+                    return True
+                elif net_position < 0 and trade.side == 'BUY':
+                    logger.info(f"🔄 POSITION CLOSING: Net SHORT position {abs(net_position)}, BUY order {trade.quantity}")
+                    return True
+                
                 # If we have more quantity in opposite direction, this trade is likely closing
                 if total_opposite_qty > total_same_qty:
                     logger.info(f"🔄 Position closing heuristic: recent opposite trades {total_opposite_qty} > same side {total_same_qty}")
                     return True
             
+            # STEP 4: Final fallback - check for quantity matching with recent opposite trades
+            logger.info(f"🔍 Final check: quantity matching analysis...")
+            one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+            
+            recent_opposite_in_hour = session.query(Trade).filter(
+                Trade.account_id == master_id,
+                Trade.symbol == trade.symbol,
+                Trade.side == opposite_side,
+                Trade.status.in_(['FILLED', 'PARTIALLY_FILLED']),
+                Trade.created_at >= one_hour_ago
+            ).all()
+            
+            if recent_opposite_in_hour:
+                total_recent_opposite = sum(t.quantity for t in recent_opposite_in_hour)
+                logger.info(f"📊 Recent {opposite_side} trades in last hour: {total_recent_opposite}")
+                
+                # If current trade quantity matches recent opposite trades closely, likely closing
+                if total_recent_opposite > 0:
+                    qty_ratio = abs(trade.quantity - total_recent_opposite) / total_recent_opposite
+                    if qty_ratio < 0.15:  # Within 15% tolerance
+                        logger.info(f"🔄 QUANTITY MATCH CLOSING: Trade {trade.quantity} ≈ recent opposite {total_recent_opposite} (diff: {qty_ratio:.2%})")
+                        return True
+            
+            logger.info(f"📈 FINAL DETERMINATION: Regular trade order (not position closing)")
             return False
             
         except Exception as e:
             logger.error(f"❌ Error checking if order is position closing: {e}")
-            return False  # Default to regular trade copying
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            # SAFE DEFAULT: Treat as regular trade to ensure copying continues
+            return False
     
     async def close_follower_positions(self, master_trade: Trade, session: Session):
-        """Close corresponding positions in follower accounts"""
+        """Close corresponding positions in follower accounts - IMPROVED VERSION"""
         try:
-            logger.info(f"🔄 Closing follower positions for master trade: {master_trade.symbol} {master_trade.side}")
+            logger.info(f"🔄 STARTING follower position closing for master trade: {master_trade.symbol} {master_trade.side} {master_trade.quantity}")
             
             # Get copy trading configurations for this master
             configs = session.query(CopyTradingConfig).filter(
@@ -1619,46 +1693,74 @@ class CopyTradingEngine:
             ).all()
             
             if not configs:
-                logger.warning(f"⚠️ No copy trading configurations found for position closing")
+                logger.warning(f"⚠️ No active copy trading configurations found for master {master_trade.account_id}")
+                self.add_system_log("WARNING", f"No active followers found for position closing", master_trade.account_id, master_trade.id)
                 return
             
-            logger.info(f"📋 Found {len(configs)} follower accounts to close positions")
+            logger.info(f"📋 Found {len(configs)} active follower accounts to process")
             
             closed_count = 0
             for config in configs:
                 try:
+                    logger.info(f"🔄 Processing follower {config.follower_account_id} (copy %: {config.copy_percentage}%)")
+                    
                     follower_client = self.follower_clients.get(config.follower_account_id)
                     if not follower_client:
                         logger.error(f"❌ Follower client not found for account {config.follower_account_id}")
+                        self.add_system_log("ERROR", f"Follower client not available for position closing", config.follower_account_id)
                         continue
                     
-                    # Get follower positions
-                    follower_positions = await follower_client.get_positions()
+                    # Get follower positions with error handling
+                    follower_positions = []
+                    try:
+                        follower_positions = await follower_client.get_positions()
+                        logger.info(f"📊 Retrieved {len(follower_positions)} positions from follower {config.follower_account_id}")
+                    except Exception as pos_error:
+                        logger.error(f"❌ Failed to get positions from follower {config.follower_account_id}: {pos_error}")
+                        self.add_system_log("ERROR", f"Failed to get positions: {pos_error}", config.follower_account_id)
+                        continue
+                    
                     position_to_close = None
                     
                     # Find the position that corresponds to what the master is closing
                     for pos in follower_positions:
                         if pos['symbol'] == master_trade.symbol:
+                            logger.info(f"📊 Found follower position: {pos['symbol']} {pos['side']} size={pos['size']}")
                             # Master is selling (closing long) -> close follower's long position
                             # Master is buying (closing short) -> close follower's short position
                             if (master_trade.side == 'SELL' and pos['side'] == 'LONG') or \
                                (master_trade.side == 'BUY' and pos['side'] == 'SHORT'):
                                 position_to_close = pos
+                                logger.info(f"🎯 MATCH: Master {master_trade.side} matches follower {pos['side']} position to close")
                                 break
+                            else:
+                                logger.info(f"ℹ️ No match: Master {master_trade.side} vs follower {pos['side']} position")
                     
                     if position_to_close:
                         # Calculate quantity to close (proportional to copy percentage)
-                        close_quantity = position_to_close['size'] * (config.copy_percentage / 100.0)
-                        close_quantity = round(close_quantity, 8)  # Fix precision
+                        raw_close_quantity = position_to_close['size'] * (config.copy_percentage / 100.0)
                         
-                        logger.info(f"🔄 Closing follower position: {config.follower_account_id} {master_trade.symbol} {position_to_close['side']} {close_quantity}")
+                        # Ensure minimum quantity and precision
+                        close_quantity = max(0.001, round(raw_close_quantity, 8))  # Minimum 0.001 with 8 decimal precision
                         
-                        # Close the position
-                        close_order = await follower_client.close_position(
-                            master_trade.symbol, 
-                            position_to_close['side'], 
-                            close_quantity
-                        )
+                        # Don't close more than the position size
+                        close_quantity = min(close_quantity, position_to_close['size'])
+                        
+                        logger.info(f"🔄 CLOSING follower position: Account={config.follower_account_id}, Symbol={master_trade.symbol}, Side={position_to_close['side']}, CloseQty={close_quantity}, PositionSize={position_to_close['size']}")
+                        
+                        # Close the position with enhanced error handling
+                        close_order = None
+                        try:
+                            close_order = await follower_client.close_position(
+                                master_trade.symbol, 
+                                position_to_close['side'], 
+                                close_quantity
+                            )
+                            logger.info(f"✅ Position close order executed successfully: {close_order.get('orderId') if close_order else 'No orderId'}")
+                        except Exception as close_error:
+                            logger.error(f"❌ Failed to close position for follower {config.follower_account_id}: {close_error}")
+                            self.add_system_log("ERROR", f"Position close failed: {close_error}", config.follower_account_id)
+                            continue
                         
                         if close_order:
                             # Record the position close as a trade
@@ -1685,11 +1787,25 @@ class CopyTradingEngine:
                         else:
                             logger.warning(f"⚠️ Failed to close position for follower {config.follower_account_id}")
                     else:
-                        logger.info(f"ℹ️ No corresponding position found to close for follower {config.follower_account_id}")
+                        # No position found to close - this might be normal
+                        if follower_positions:
+                            logger.info(f"ℹ️ No {master_trade.symbol} position found to close for follower {config.follower_account_id}")
+                            # Log what positions they do have for debugging
+                            symbol_positions = [f"{pos['symbol']} {pos['side']}" for pos in follower_positions if pos['symbol'] == master_trade.symbol]
+                            if symbol_positions:
+                                logger.info(f"📊 Follower has different {master_trade.symbol} positions: {symbol_positions}")
+                            else:
+                                logger.info(f"📊 Follower has no {master_trade.symbol} positions at all")
+                        else:
+                            logger.info(f"ℹ️ Follower {config.follower_account_id} has no positions")
+                        
+                        self.add_system_log("INFO", f"No {master_trade.symbol} position to close (master closed {master_trade.side})", config.follower_account_id)
                         
                 except Exception as follower_error:
-                    logger.error(f"❌ Error closing position for follower {config.follower_account_id}: {follower_error}")
-                    self.add_system_log("ERROR", f"❌ Error closing position: {follower_error}", config.follower_account_id)
+                    logger.error(f"❌ Error processing follower {config.follower_account_id}: {follower_error}")
+                    import traceback
+                    logger.error(f"Full traceback: {traceback.format_exc()}")
+                    self.add_system_log("ERROR", f"Error in position closing: {follower_error}", config.follower_account_id)
             
             if closed_count > 0:
                 logger.info(f"✅ Successfully closed positions for {closed_count}/{len(configs)} followers")
