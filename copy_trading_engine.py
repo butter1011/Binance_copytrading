@@ -326,8 +326,16 @@ class CopyTradingEngine:
         """Check for new trades in master account using Binance API"""
         try:
             # Get the last trade timestamp for this master
-            # STARTUP PROTECTION: Never go back further than server startup time
-            default_check_time = max(datetime.utcnow() - timedelta(hours=1), self.server_start_time)
+            # STARTUP PROTECTION: On startup, only look back 2 minutes maximum
+            if master_id not in self.startup_complete:
+                # On startup, only look back 2 minutes or server start time, whichever is later
+                two_minutes_ago = datetime.utcnow() - timedelta(minutes=2)
+                default_check_time = max(two_minutes_ago, self.server_start_time)
+                logger.info(f"🚀 STARTUP MODE: Only looking back to {default_check_time} (max 2 minutes)")
+            else:
+                # Normal operation - never go back further than server startup time
+                default_check_time = max(datetime.utcnow() - timedelta(hours=1), self.server_start_time)
+            
             last_check = self.last_trade_check.get(master_id, default_check_time)
             logger.info(f"🕐 Default check time: {default_check_time}, Last check: {last_check}")
             
@@ -352,8 +360,23 @@ class CopyTradingEngine:
                 if recent_orders:
                     logger.info(f"Found {len(recent_orders)} recent orders for master {master_id}")
                     
-                    # Sort orders by time to process them in chronological order
-                    recent_orders.sort(key=lambda x: x.get('time', x.get('updateTime', 0)))
+                    # Sort orders with priority: NEW orders first, then by time
+                    def order_priority(order):
+                        status = order.get('status', 'UNKNOWN')
+                        time_value = order.get('time', order.get('updateTime', 0))
+                        
+                        # Priority order: NEW (0), PARTIALLY_FILLED (1), FILLED (2), others (3)
+                        if status in ['NEW', 'PARTIALLY_FILLED']:
+                            priority = 0
+                        elif status == 'FILLED':
+                            priority = 1
+                        else:
+                            priority = 2
+                        
+                        return (priority, time_value)
+                    
+                    recent_orders.sort(key=order_priority)
+                    logger.info(f"📊 Sorted orders by priority (NEW orders first)")
                     
                     for order in recent_orders:
                         try:
@@ -552,16 +575,41 @@ class CopyTradingEngine:
                 logger.info(f"🛡️ STARTUP PROTECTION: Skipping order {order_id} from {order_time} (before server start {self.server_start_time})")
                 return
             
-            # ADDITIONAL PROTECTION: Skip cancelled orders that are more than 2 minutes old
+            # AGGRESSIVE PROTECTION: Only process very recent orders
+            five_minutes_ago = datetime.utcnow() - timedelta(minutes=5)
+            
+            # For cancelled orders, be even more strict - only process if within 30 seconds
             if order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
-                two_minutes_ago = datetime.utcnow() - timedelta(minutes=2)
-                if order_time < two_minutes_ago:
-                    logger.info(f"🛡️ CANCELLED ORDER FILTER: Skipping old cancelled order {order_id} from {order_time} (older than 2 minutes)")
+                thirty_seconds_ago = datetime.utcnow() - timedelta(seconds=30)
+                if order_time < thirty_seconds_ago:
+                    logger.info(f"🛡️ CANCELLED ORDER FILTER: Skipping old cancelled order {order_id} from {order_time} (older than 30 seconds)")
                     return
                 else:
-                    logger.info(f"⚠️ Processing recent cancelled order {order_id} from {order_time}")
+                    logger.info(f"⚠️ Processing very recent cancelled order {order_id} from {order_time}")
+            
+            # For NEW orders (most important), be more lenient - allow up to 10 minutes
+            elif order_status in ['NEW', 'PARTIALLY_FILLED']:
+                ten_minutes_ago = datetime.utcnow() - timedelta(minutes=10)
+                if order_time < ten_minutes_ago:
+                    logger.info(f"🛡️ OLD NEW ORDER FILTER: Skipping old NEW order {order_id} from {order_time} (older than 10 minutes)")
+                    return
+                else:
+                    logger.info(f"🚀 NEW ORDER DETECTED: Processing {order_id} from {order_time} - PRIORITY")
+            
+            # For FILLED orders, allow up to 5 minutes
+            elif order_status == 'FILLED':
+                if order_time < five_minutes_ago:
+                    logger.info(f"🛡️ OLD FILLED ORDER FILTER: Skipping old FILLED order {order_id} from {order_time} (older than 5 minutes)")
+                    return
+                else:
+                    logger.info(f"✅ FILLED ORDER: Processing {order_id} from {order_time}")
+            
+            # For all other orders, only process if within 5 minutes
+            elif order_time < five_minutes_ago:
+                logger.info(f"🛡️ OLD ORDER FILTER: Skipping old order {order_id} from {order_time} (older than 5 minutes)")
+                return
             else:
-                logger.info(f"✅ Order {order_id} is after server startup - processing")
+                logger.info(f"✅ Order {order_id} is recent - processing")
             
             # Check if this order is from before restart (prevent duplicate processing)
             if master_id in self.last_processed_order_time:
