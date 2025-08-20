@@ -31,6 +31,7 @@ class CopyTradingEngine:
         self.startup_complete = {}  # account_id -> bool to track if startup processing is complete
         self.server_start_time = datetime.utcnow()  # Track when the server started
         logger.info(f"🏗️ CopyTradingEngine initialized at {self.server_start_time}")
+        logger.info(f"🕐 Server startup time (timestamp): {self.server_start_time.timestamp()}")
         
     async def initialize(self):
         """Initialize the copy trading engine"""
@@ -245,6 +246,15 @@ class CopyTradingEngine:
             logger.warning("Copy trading engine is already running")
             return
         
+        # Reset server start time to NOW when actually starting monitoring
+        self.server_start_time = datetime.utcnow()
+        logger.info(f"🕐 RESET: Server start time set to {self.server_start_time}")
+        logger.info(f"🕐 RESET: Server startup time (timestamp): {self.server_start_time.timestamp()}")
+        
+        # Clear startup completion flags to ensure startup protection is applied
+        self.startup_complete.clear()
+        logger.info(f"🧹 Cleared startup completion flags")
+        
         self.is_running = True
         logger.info("Starting copy trading monitoring...")
         
@@ -252,7 +262,9 @@ class CopyTradingEngine:
         for master_id, client in self.master_clients.items():
             task = asyncio.create_task(self.monitor_master_account(master_id, client))
             self.monitoring_tasks[master_id] = task
-            self.last_trade_check[master_id] = datetime.utcnow()
+            # Set last trade check to server start time to ensure startup protection
+            self.last_trade_check[master_id] = self.server_start_time
+            logger.info(f"🕐 Set last_trade_check for master {master_id} to {self.server_start_time}")
             # Initialize processed orders tracking for this master
             if master_id not in self.processed_orders:
                 self.processed_orders[master_id] = set()
@@ -314,7 +326,10 @@ class CopyTradingEngine:
         """Check for new trades in master account using Binance API"""
         try:
             # Get the last trade timestamp for this master
-            last_check = self.last_trade_check.get(master_id, datetime.utcnow() - timedelta(hours=1))
+            # STARTUP PROTECTION: Never go back further than server startup time
+            default_check_time = max(datetime.utcnow() - timedelta(hours=1), self.server_start_time)
+            last_check = self.last_trade_check.get(master_id, default_check_time)
+            logger.info(f"🕐 Default check time: {default_check_time}, Last check: {last_check}")
             
             # STARTUP PROTECTION: On first run, only process orders created after server startup time
             if master_id not in self.startup_complete:
@@ -532,9 +547,12 @@ class CopyTradingEngine:
             logger.info(f"🔍 Order details: ID={order_id}, ExecutedQty={executed_qty}, Type={order.get('type', 'UNKNOWN')}")
             
             # STARTUP PROTECTION: Skip orders from before server startup time
+            logger.info(f"🕐 Comparing order time {order_time} vs server start {self.server_start_time}")
             if order_time < self.server_start_time:
                 logger.info(f"🛡️ STARTUP PROTECTION: Skipping order {order_id} from {order_time} (before server start {self.server_start_time})")
                 return
+            else:
+                logger.info(f"✅ Order {order_id} is after server startup - processing")
             
             # Check if this order is from before restart (prevent duplicate processing)
             if master_id in self.last_processed_order_time:
