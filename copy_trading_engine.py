@@ -1137,8 +1137,32 @@ class CopyTradingEngine:
                 quantity = round(quantity, 1)
                 logger.info(f"📏 Applied safety precision rounding: -> {quantity}")
             
-            # Calculate notional value for logging purposes only
+            # Calculate notional value and handle Binance's $5 minimum requirement
             notional_value = quantity * master_trade.price if master_trade.price else 0
+            binance_min_notional = 5.0  # Binance enforces this regardless of our settings
+            
+            if notional_value < binance_min_notional and master_trade.price > 0:
+                logger.warning(f"⚠️ Order value ${notional_value:.2f} is below Binance's ${binance_min_notional} minimum")
+                logger.warning(f"📊 Current quantity: {quantity}, Price: {master_trade.price}")
+                
+                # Calculate minimum quantity needed to meet Binance requirement
+                min_quantity_needed = binance_min_notional / master_trade.price
+                
+                # Try to adjust quantity to meet minimum notional requirement
+                try:
+                    adjusted_min_quantity = await follower_client.adjust_quantity_precision(master_trade.symbol, min_quantity_needed)
+                    new_notional = adjusted_min_quantity * master_trade.price
+                    
+                    logger.info(f"🔧 Adjusting quantity to meet Binance minimum: {quantity} -> {adjusted_min_quantity}")
+                    logger.info(f"💰 New order value: ${new_notional:.2f} (meets ${binance_min_notional} requirement)")
+                    
+                    quantity = adjusted_min_quantity
+                    notional_value = new_notional
+                    
+                except Exception as adjust_error:
+                    logger.error(f"⚠️ Failed to adjust quantity for Binance minimum: {adjust_error}")
+                    logger.warning(f"⚠️ Skipping this trade - cannot meet Binance's ${binance_min_notional} minimum")
+                    return False
             
             # Validate trade parameters before placing order
             logger.info(f"🎯 Placing follower order: {master_trade.symbol} {master_trade.side} {quantity} ({master_trade.order_type})")
@@ -1270,11 +1294,12 @@ class CopyTradingEngine:
                 logger.error(f"📊 Problem quantity was: {quantity}")
             elif "code=-4164" in error_msg:
                 notional_value = quantity * master_trade.price if master_trade.price else 0
-                logger.error("❌ NOTIONAL VALUE ERROR!")
-                logger.error(f"📊 Order value: ${notional_value:.2f}")
+                logger.error("❌ BINANCE MINIMUM NOTIONAL ERROR!")
+                logger.error(f"📊 Order value: ${notional_value:.2f} (Binance requires $5.00 minimum)")
                 logger.error(f"📊 Quantity: {quantity}, Price: {master_trade.price}")
-                logger.error(f"💡 This may be a Binance-side restriction for very small orders")
-                logger.warning(f"⚠️ Order failed due to notional value issue")
+                logger.error(f"💡 This error should have been handled by pre-validation")
+                logger.error(f"🔧 If you see this error, there may be a precision issue")
+                logger.warning(f"⚠️ Order failed - Binance rejected due to minimum notional requirement")
                 # Don't rollback the session for this error - continue processing
                 return False
             else:
