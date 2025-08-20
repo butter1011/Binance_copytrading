@@ -851,7 +851,8 @@ class CopyTradingEngine:
             # Get current account balances
             follower_balance = await follower_client.get_balance()
             if follower_balance <= 0:
-                logger.warning(f"⚠️ Could not get follower balance or balance is zero")
+                logger.warning(f"⚠️ Could not get follower balance or balance is zero: {follower_balance}")
+                logger.warning(f"⚠️ Falling back to stored balance calculation for proportional copying")
                 return await self.calculate_fallback_quantity(master_trade, config)
             
             # Get master balance
@@ -960,6 +961,7 @@ class CopyTradingEngine:
             logger.error(f"Error calculating follower quantity: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.warning(f"⚠️ Main calculation failed, falling back to proportional calculation using stored balances")
             return await self.calculate_fallback_quantity(master_trade, config)
     
     async def calculate_risk_based_quantity(self, follower_balance: float, follower_account, mark_price: float, master_trade: Trade, config: CopyTradingConfig) -> float:
@@ -1083,14 +1085,48 @@ class CopyTradingEngine:
             return quantity
     
     async def calculate_fallback_quantity(self, master_trade: Trade, config: CopyTradingConfig) -> float:
-        """Fallback calculation when balance-based sizing fails"""
+        """Fallback calculation when balance-based sizing fails - still tries to maintain proportional logic"""
         try:
-            # Conservative fallback: use copy percentage with reduced scaling
+            session = get_session()
+            follower_account = session.query(Account).filter(Account.id == config.follower_account_id).first()
+            master_account = session.query(Account).filter(Account.id == master_trade.account_id).first()
+            session.close()
+            
+            # Try to use stored balances for proportional calculation
+            if (follower_account and master_account and 
+                follower_account.balance > 0 and master_account.balance > 0):
+                
+                # Calculate balance ratio using stored balances
+                balance_ratio = follower_account.balance / master_account.balance
+                
+                # Calculate master trade's notional value
+                master_price = master_trade.price if master_trade.price > 0 else 1.0
+                master_notional = master_trade.quantity * master_price
+                
+                # Scale proportionally based on balance ratio
+                follower_notional = master_notional * balance_ratio
+                fallback_quantity = follower_notional / master_price
+                
+                # Apply copy percentage and safety reduction
+                fallback_quantity *= (config.copy_percentage / 100.0) * 0.8  # 20% safety reduction
+                fallback_quantity = round(fallback_quantity, 8)
+                
+                logger.warning(f"⚠️ Using proportional fallback calculation: {fallback_quantity}")
+                logger.warning(f"   Master balance (stored): ${master_account.balance:.2f}")
+                logger.warning(f"   Follower balance (stored): ${follower_account.balance:.2f}")
+                logger.warning(f"   Balance ratio: {balance_ratio:.4f}")
+                logger.warning(f"   Master notional: ${master_notional:.2f}")
+                logger.warning(f"   Copy%: {config.copy_percentage}%, Safety reduction: 20%")
+                
+                return fallback_quantity
+            
+            # Final fallback: conservative fixed percentage
             fallback_quantity = master_trade.quantity * (config.copy_percentage / 100.0) * 0.5  # 50% reduction for safety
             fallback_quantity = round(fallback_quantity, 8)
             
-            logger.warning(f"⚠️ Using fallback quantity calculation: {fallback_quantity}")
+            logger.warning(f"⚠️ Using conservative fallback quantity calculation: {fallback_quantity}")
             logger.warning(f"   Master quantity: {master_trade.quantity}, Copy%: {config.copy_percentage}%, Safety reduction: 50%")
+            logger.warning(f"   Reason: Could not get balance information for proportional calculation")
             
             return fallback_quantity
             
