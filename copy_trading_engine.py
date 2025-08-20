@@ -321,9 +321,13 @@ class CopyTradingEngine:
                 if recent_orders:
                     logger.info(f"Found {len(recent_orders)} recent orders for master {master_id}")
                     
+                    # Sort orders by time to process them in chronological order
+                    recent_orders.sort(key=lambda x: x.get('time', x.get('updateTime', 0)))
+                    
                     for order in recent_orders:
                         try:
-                            logger.info(f"📝 About to process order {order['orderId']} for master {master_id}")
+                            order_status = order.get('status', 'UNKNOWN')
+                            logger.info(f"📝 About to process order {order['orderId']} (Status: {order_status}) for master {master_id}")
                             await self.process_master_order(master_id, order)
                             logger.info(f"✅ Successfully processed order {order['orderId']} for master {master_id}")
                         except Exception as order_error:
@@ -409,21 +413,27 @@ class CopyTradingEngine:
                 # 1. They are open orders (NEW/PARTIALLY_FILLED) - regardless of time
                 # 2. They are recent filled orders (within time range)
                 # 3. They are recent cancelled/expired orders (need to cancel followers)
+                # 4. ANY filled orders in the last 5 minutes to catch fast-filling orders
                 is_open_order = order_status in ['NEW', 'PARTIALLY_FILLED']
                 is_recent_filled = order_status == 'FILLED' and order_time >= start_time
+                # EXTENDED WINDOW: Also catch FILLED orders from last 5 minutes to handle fast execution
+                five_minutes_ago = int((datetime.utcnow() - timedelta(minutes=5)).timestamp() * 1000)
+                is_recently_filled = order_status == 'FILLED' and order_time >= five_minutes_ago
                 # For cancelled orders, process recent ones (within normal time range) to handle follower cancellations
                 is_recent_cancelled = order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and order_time >= start_time
                 
                 if (order_id not in seen_orders and 
                     order['side'] in ['BUY', 'SELL'] and 
                     order_status in ['NEW', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and
-                    (is_open_order or is_recent_filled or is_recent_cancelled)):
+                    (is_open_order or is_recent_filled or is_recently_filled or is_recent_cancelled)):
                     seen_orders.add(order_id)
                     relevant_orders.append(order)
                     if is_open_order:
                         status_note = "📋 OPEN"
                     elif is_recent_cancelled:
                         status_note = "❌ CANCELLED"
+                    elif is_recently_filled:
+                        status_note = "🏁 FILLED (Extended Window)"
                     else:
                         status_note = "🏁 RECENT"
                     # Fix timestamp display for logging
@@ -437,10 +447,11 @@ class CopyTradingEngine:
                         logger.debug(f"⏭️ Skipping non-trading order: {order_id} (side: {order['side']})")
                     elif order_status not in ['NEW', 'PARTIALLY_FILLED', 'FILLED']:
                         logger.debug(f"⏭️ Skipping order with status: {order_id} (status: {order_status})")
-                    elif not (is_open_order or is_recent_filled):
+                    elif not (is_open_order or is_recent_filled or is_recently_filled):
                         timestamp_display = datetime.fromtimestamp(order_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
                         start_time_display = datetime.fromtimestamp(start_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
-                        logger.debug(f"⏭️ Skipping old order: {order_id} (time: {timestamp_display}, threshold: {start_time_display})")
+                        five_min_display = datetime.fromtimestamp(five_minutes_ago / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                        logger.debug(f"⏭️ Skipping old order: {order_id} (time: {timestamp_display}, normal threshold: {start_time_display}, extended threshold: {five_min_display})")
             
             logger.info(f"✅ Found {len(relevant_orders)} relevant orders (open + filled)")
             return relevant_orders
@@ -620,10 +631,24 @@ class CopyTradingEngine:
             session.refresh(db_trade)
             logger.info(f"✅ Trade {db_trade.id} saved to database successfully")
             
-            # Copy to followers immediately when orders are placed (NEW) or filled
-            # This ensures followers trade simultaneously with master, not after completion
+            # Copy to followers for NEW orders and FILLED orders  
+            # Also handle case where we missed the NEW state and only see FILLED
             if order_status in ['NEW', 'FILLED']:
                 logger.info(f"🚀 Copying {order_status.lower()} order to followers immediately")
+                
+                # For FILLED orders, check if we already copied this as NEW to avoid duplicates
+                if order_status == 'FILLED':
+                    existing_copy = session.query(Trade).filter(
+                        Trade.master_trade_id == db_trade.id,
+                        Trade.copied_from_master == True
+                    ).first()
+                    
+                    if existing_copy:
+                        logger.info(f"📝 FILLED order already copied when it was NEW, skipping duplicate")
+                        session.close()
+                        return
+                    else:
+                        logger.info(f"🎯 FILLED order was not copied as NEW - copying now (this handles fast-filling orders)")
                 
                 # Check if this is a position closing order (reduceOnly = True or opposite direction trade)
                 if await self.is_position_closing_order(master_id, db_trade, session):
