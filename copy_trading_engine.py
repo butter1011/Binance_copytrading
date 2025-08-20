@@ -378,9 +378,22 @@ class CopyTradingEngine:
                     recent_orders.sort(key=order_priority)
                     logger.info(f"📊 Sorted orders by priority (NEW orders first)")
                     
+                    # Count different order types for debugging
+                    order_counts = {}
+                    for order in recent_orders:
+                        status = order.get('status', 'UNKNOWN')
+                        order_counts[status] = order_counts.get(status, 0) + 1
+                    
+                    logger.info(f"📊 Order breakdown: {order_counts}")
+                    
                     for order in recent_orders:
                         try:
                             order_status = order.get('status', 'UNKNOWN')
+                            order_time = datetime.fromtimestamp(order.get('time', order.get('updateTime', 0)) / 1000)
+                            
+                            if order_status in ['NEW', 'PARTIALLY_FILLED']:
+                                logger.info(f"🚀 DETECTED NEW ORDER: {order['orderId']} ({order_status}) from {order_time} for master {master_id}")
+                            
                             logger.info(f"📝 About to process order {order['orderId']} (Status: {order_status}) for master {master_id}")
                             await self.process_master_order(master_id, order)
                             logger.info(f"✅ Successfully processed order {order['orderId']} for master {master_id}")
@@ -578,11 +591,20 @@ class CopyTradingEngine:
             # AGGRESSIVE PROTECTION: Only process very recent orders
             five_minutes_ago = datetime.utcnow() - timedelta(minutes=5)
             
-            # For cancelled orders, be even more strict - only process if within 30 seconds
+            # COMPLETE BLOCK: Do not process any cancelled orders during startup period
             if order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED']:
-                thirty_seconds_ago = datetime.utcnow() - timedelta(seconds=30)
-                if order_time < thirty_seconds_ago:
-                    logger.info(f"🛡️ CANCELLED ORDER FILTER: Skipping old cancelled order {order_id} from {order_time} (older than 30 seconds)")
+                # Calculate how long the server has been running
+                server_uptime = datetime.utcnow() - self.server_start_time
+                
+                # Block ALL cancelled orders for the first 10 minutes after server startup
+                if server_uptime < timedelta(minutes=10):
+                    logger.info(f"🛡️ STARTUP BLOCK: Skipping cancelled order {order_id} from {order_time} (server uptime: {server_uptime})")
+                    return
+                
+                # After startup period, only process cancelled orders within 10 seconds
+                ten_seconds_ago = datetime.utcnow() - timedelta(seconds=10)
+                if order_time < ten_seconds_ago:
+                    logger.info(f"🛡️ CANCELLED ORDER FILTER: Skipping old cancelled order {order_id} from {order_time} (older than 10 seconds)")
                     return
                 else:
                     logger.info(f"⚠️ Processing very recent cancelled order {order_id} from {order_time}")
