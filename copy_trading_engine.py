@@ -872,6 +872,7 @@ class CopyTradingEngine:
             logger.info(f"🔍 DIAGNOSTIC - Input trade: {master_trade.quantity} {master_trade.symbol} @ ${master_trade.price}")
             
             # OPTION 1: Balance Ratio Position Sizing (Primary method - maintains proportional risk)
+            # This calculates proportional position size, then safety limits will apply the account's risk percentage
             if master_balance > 0 and follower_balance > 0:
                 quantity = await self.calculate_balance_ratio_quantity(
                     master_trade, master_balance, follower_balance, mark_price, config
@@ -954,17 +955,26 @@ class CopyTradingEngine:
             return 0
     
     async def calculate_balance_proportional_quantity(self, follower_balance: float, mark_price: float, master_trade: Trade, config: CopyTradingConfig) -> float:
-        """Calculate position size proportional to account balance"""
+        """Calculate position size proportional to account balance using account's risk percentage"""
         try:
-            # Use a conservative approach: risk 2% of balance per trade
-            conservative_risk_percentage = 2.0
-            risk_amount = follower_balance * (conservative_risk_percentage / 100.0)
+            # Get the follower account to access its risk percentage
+            session = get_session()
+            follower_account = session.query(Account).filter(Account.id == config.follower_account_id).first()
+            session.close()
+            
+            if not follower_account:
+                logger.error(f"❌ Follower account not found for balance-proportional calculation")
+                return 0
+            
+            # Use the account's configured risk percentage
+            risk_amount = follower_balance * (follower_account.risk_percentage / 100.0)
             
             # Calculate quantity based on risk amount
             quantity = risk_amount / mark_price
             
             logger.info(f"📊 Balance-proportional calculation:")
-            logger.info(f"   Conservative risk: ${risk_amount:.2f} ({conservative_risk_percentage}% of ${follower_balance:.2f})")
+            logger.info(f"   Account risk percentage: {follower_account.risk_percentage}%")
+            logger.info(f"   Risk amount: ${risk_amount:.2f} ({follower_account.risk_percentage}% of ${follower_balance:.2f})")
             logger.info(f"   Calculated quantity: {quantity}")
             
             return quantity
@@ -991,14 +1001,19 @@ class CopyTradingEngine:
             follower_notional = master_notional * balance_ratio
             quantity = follower_notional / mark_price
             
+            # Calculate the resulting risk percentage for the follower
+            follower_risk_percentage = (follower_notional / follower_balance) * 100
+            
             logger.info(f"📊 Balance-ratio calculation:")
             logger.info(f"   Master balance: ${master_balance:.2f}")
             logger.info(f"   Follower balance: ${follower_balance:.2f}")
             logger.info(f"   Balance ratio: {balance_ratio:.4f}")
             logger.info(f"   Master notional: ${master_notional:.2f}")
             logger.info(f"   Master risk %: {master_risk_percentage:.2f}%")
-            logger.info(f"   Follower notional: ${follower_notional:.2f}")
-            logger.info(f"   Calculated quantity: {quantity}")
+            logger.info(f"   Expected follower quantity: {quantity:.6f}")
+            logger.info(f"   Expected follower notional: ${follower_notional:.2f}")
+            logger.info(f"   Expected follower risk %: {follower_risk_percentage:.2f}%")
+            logger.info(f"   Note: Account risk limit will be applied in safety limits")
             
             return quantity
             
@@ -1007,16 +1022,18 @@ class CopyTradingEngine:
             return 0
     
     async def apply_safety_limits(self, quantity: float, follower_balance: float, mark_price: float, follower_account, master_trade: Trade) -> float:
-        """Apply safety limits to prevent excessive risk"""
+        """Apply safety limits to prevent excessive risk using account's configured risk percentage"""
         try:
             original_quantity = quantity
             
-            # 1. Maximum position size: 20% of balance (conservative limit)
-            max_position_value = follower_balance * 0.20  # 20% max
+            # 1. Maximum position size: Use account's configured risk percentage
+            # The risk percentage from dashboard represents the maximum % of balance to risk per trade
+            max_position_value = follower_balance * (follower_account.risk_percentage / 100.0)
             max_quantity_by_balance = max_position_value / mark_price
             
             if quantity > max_quantity_by_balance:
-                logger.warning(f"⚠️ Quantity reduced by balance limit: {quantity} -> {max_quantity_by_balance}")
+                logger.warning(f"⚠️ Quantity reduced by account risk limit: {quantity} -> {max_quantity_by_balance}")
+                logger.warning(f"   Account risk percentage: {follower_account.risk_percentage}%")
                 quantity = max_quantity_by_balance
             
             # 2. Maximum leverage check: prevent over-leveraging
@@ -1032,16 +1049,33 @@ class CopyTradingEngine:
             
             # 3. Minimum position size check removed to allow small trades
             
-            # 4. Maximum single trade risk: 10% of balance
-            max_risk_value = follower_balance * 0.10  # 10% max risk per trade
-            max_quantity_by_risk = max_risk_value / mark_price
+            # 4. Final risk validation using account's configured risk percentage
+            position_value = quantity * mark_price
+            risk_percentage = (position_value / follower_balance) * 100
             
-            if quantity > max_quantity_by_risk:
-                logger.warning(f"⚠️ Quantity reduced by risk limit: {quantity} -> {max_quantity_by_risk}")
+            # Log the final risk assessment
+            logger.info(f"📊 Final risk assessment:")
+            logger.info(f"   Account configured risk: {follower_account.risk_percentage}%")
+            logger.info(f"   Actual position risk: {risk_percentage:.1f}%")
+            logger.info(f"   Position value: ${position_value:.2f}")
+            
+            if risk_percentage > follower_account.risk_percentage:
+                logger.warning(f"⚠️ Position risk ({risk_percentage:.1f}%) exceeds account limit ({follower_account.risk_percentage}%)")
+                # Recalculate quantity to match the account's risk percentage
+                max_risk_value = follower_balance * (follower_account.risk_percentage / 100.0)
+                max_quantity_by_risk = max_risk_value / mark_price
                 quantity = max_quantity_by_risk
+                logger.warning(f"⚠️ Quantity adjusted to match account risk limit: {original_quantity} -> {quantity}")
+            else:
+                logger.info(f"📊 Position risk ({risk_percentage:.1f}%) is within account limit ({follower_account.risk_percentage}%)")
             
             if quantity != original_quantity:
                 logger.info(f"📊 Safety limits applied: {original_quantity:.8f} -> {quantity:.8f}")
+                final_notional = quantity * mark_price
+                final_risk_percentage = (final_notional / follower_balance) * 100
+                logger.info(f"📊 Final position: ${final_notional:.2f} ({final_risk_percentage:.1f}% of balance)")
+            else:
+                logger.info(f"📊 No safety limits applied - quantity unchanged: {quantity:.8f}")
             
             return quantity
             
