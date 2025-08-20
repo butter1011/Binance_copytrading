@@ -29,7 +29,8 @@ class CopyTradingEngine:
         self.processed_orders = {}  # account_id -> set of order_ids to avoid duplicates
         self.last_processed_order_time = {}  # account_id -> datetime to avoid processing old orders on restart
         self.startup_complete = {}  # account_id -> bool to track if startup processing is complete
-        logger.info("🏗️ CopyTradingEngine initialized")
+        self.server_start_time = datetime.utcnow()  # Track when the server started
+        logger.info(f"🏗️ CopyTradingEngine initialized at {self.server_start_time}")
         
     async def initialize(self):
         """Initialize the copy trading engine"""
@@ -315,13 +316,12 @@ class CopyTradingEngine:
             # Get the last trade timestamp for this master
             last_check = self.last_trade_check.get(master_id, datetime.utcnow() - timedelta(hours=1))
             
-            # STARTUP PROTECTION: On first run, only look at very recent orders to avoid processing old cancelled orders
+            # STARTUP PROTECTION: On first run, only process orders created after server startup time
             if master_id not in self.startup_complete:
-                logger.info(f"🚀 First run for master {master_id} - only processing very recent orders (last 2 minutes)")
-                # For first run, only look at orders from the last 2 minutes
-                startup_time = datetime.utcnow() - timedelta(minutes=2)
-                effective_last_check = max(last_check, startup_time)
-                logger.info(f"📅 Adjusted time window: {last_check} -> {effective_last_check}")
+                logger.info(f"🚀 First run for master {master_id} - only processing orders created after server startup")
+                # For first run, only look at orders created after the server started
+                effective_last_check = max(last_check, self.server_start_time)
+                logger.info(f"📅 Server started at {self.server_start_time}, adjusted time window: {last_check} -> {effective_last_check}")
                 # Mark startup as complete after first check
                 self.startup_complete[master_id] = True
             else:
@@ -370,10 +370,15 @@ class CopyTradingEngine:
             import asyncio
             loop = asyncio.get_event_loop()
             
-            # Convert datetime to timestamp
-            start_time = int(since_time.timestamp() * 1000)
+            # During startup, ensure we don't fetch orders from before the server started
+            effective_since_time = max(since_time, self.server_start_time)
             
-            logger.info(f"🔍 Fetching orders since {since_time}")
+            # Convert datetime to timestamp
+            start_time = int(effective_since_time.timestamp() * 1000)
+            
+            if effective_since_time != since_time:
+                logger.info(f"🔍 Startup protection: Adjusted time from {since_time} to {effective_since_time}")
+            logger.info(f"🔍 Fetching orders since {effective_since_time}")
             
             # Get both open orders and recent historical orders
             all_orders = []
@@ -398,12 +403,14 @@ class CopyTradingEngine:
             except Exception as e:
                 logger.warning(f"⚠️ Failed to get open orders: {e}")
             
-            # 2. Get recent historical orders - REDUCED TIME WINDOW to prevent processing old orders
+            # 2. Get recent historical orders - STARTUP PROTECTION to prevent processing old orders
             try:
-                # Use a much shorter time window to avoid processing old cancelled orders
-                # Only look back 10 minutes instead of the full time since last check
+                # During startup, never look back further than server start time
+                # After startup, limit to 10 minutes to avoid processing old cancelled orders
+                server_start_time_ms = int(self.server_start_time.timestamp() * 1000)
                 ten_minutes_ago = int((datetime.utcnow() - timedelta(minutes=10)).timestamp() * 1000)
-                effective_start_time = max(start_time, ten_minutes_ago)
+                # Use the latest of: requested start time, 10 minutes ago, or server start time
+                effective_start_time = max(start_time, ten_minutes_ago, server_start_time_ms)
                 
                 historical_orders = await loop.run_in_executor(
                     None, 
@@ -433,11 +440,15 @@ class CopyTradingEngine:
                 # STRICT FILTERING: Only process orders that are:
                 # 1. Open orders (NEW/PARTIALLY_FILLED) - regardless of time
                 # 2. Very recent filled orders (within last 5 minutes)
-                # 3. Very recent cancelled orders (within last 5 minutes) - only if we have active followers
+                # 3. Very recent cancelled orders (within last 5 minutes) - but NEVER from before server startup
                 is_open_order = order_status in ['NEW', 'PARTIALLY_FILLED']
                 five_minutes_ago = int((datetime.utcnow() - timedelta(minutes=5)).timestamp() * 1000)
+                server_start_time_ms = int(self.server_start_time.timestamp() * 1000)
                 is_recently_filled = order_status == 'FILLED' and order_time >= five_minutes_ago
-                is_recently_cancelled = order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and order_time >= five_minutes_ago
+                # For cancelled orders, they must be both recent AND after server startup
+                is_recently_cancelled = (order_status in ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'] and 
+                                       order_time >= five_minutes_ago and 
+                                       order_time >= server_start_time_ms)
                 
                 if (order_id not in seen_orders and 
                     order['side'] in ['BUY', 'SELL'] and 
