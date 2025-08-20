@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import time
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
@@ -1152,6 +1153,26 @@ class CopyTradingEngine:
                 try:
                     adjusted_min_quantity = await follower_client.adjust_quantity_precision(master_trade.symbol, min_quantity_needed)
                     new_notional = adjusted_min_quantity * master_trade.price
+                    
+                    # If precision adjustment rounded down below minimum, round up more
+                    if new_notional < binance_min_notional:
+                        logger.warning(f"⚠️ Precision adjustment rounded down: ${new_notional:.2f} < ${binance_min_notional}")
+                        # Add a small buffer and try again
+                        buffered_quantity = min_quantity_needed * 1.02  # 2% buffer
+                        adjusted_min_quantity = await follower_client.adjust_quantity_precision(master_trade.symbol, buffered_quantity)
+                        new_notional = adjusted_min_quantity * master_trade.price
+                        logger.info(f"🔧 Applied 2% buffer: {buffered_quantity} -> {adjusted_min_quantity}")
+                        
+                        # If still below minimum after buffer, calculate exact steps needed
+                        if new_notional < binance_min_notional:
+                            # Get the step size and round up to next step
+                            step_info = await follower_client.get_symbol_info(master_trade.symbol)
+                            if step_info and 'stepSize' in step_info:
+                                step_size = float(step_info['stepSize'])
+                                steps_needed = math.ceil(min_quantity_needed / step_size)
+                                adjusted_min_quantity = steps_needed * step_size
+                                new_notional = adjusted_min_quantity * master_trade.price
+                                logger.info(f"🔧 Rounded up to next step: {steps_needed} steps of {step_size} = {adjusted_min_quantity}")
                     
                     logger.info(f"🔧 Adjusting quantity to meet Binance minimum: {quantity} -> {adjusted_min_quantity}")
                     logger.info(f"💰 New order value: ${new_notional:.2f} (meets ${binance_min_notional} requirement)")
