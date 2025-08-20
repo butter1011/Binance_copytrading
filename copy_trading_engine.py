@@ -777,8 +777,8 @@ class CopyTradingEngine:
                         logger.info(f"✅ Successfully placed follower trade for account {config.follower_account_id}")
                         self.add_system_log("INFO", f"✅ Successfully placed follower trade: {master_trade.symbol} {master_trade.side} Qty: {follower_quantity}", config.follower_account_id)
                     else:
-                        logger.warning(f"⚠️ Follower trade was skipped for account {config.follower_account_id} (likely due to minimum notional or other validation)")
-                        self.add_system_log("WARNING", f"⚠️ Follower trade skipped: {master_trade.symbol} (minimum notional or validation issue)", config.follower_account_id)
+                        logger.warning(f"⚠️ Follower trade was skipped for account {config.follower_account_id} (likely due to validation issue)")
+                        self.add_system_log("WARNING", f"⚠️ Follower trade skipped: {master_trade.symbol} (validation issue)", config.follower_account_id)
                 except Exception as follower_error:
                     error_msg = f"❌ FAILED TO PLACE FOLLOWER TRADE for account {config.follower_account_id}: {follower_error}"
                     logger.error(error_msg)
@@ -1027,13 +1027,7 @@ class CopyTradingEngine:
                 logger.warning(f"   Effective leverage would be {effective_leverage:.1f}x, max allowed: {max_allowed_leverage:.1f}x")
                 quantity = safe_quantity
             
-            # 3. Minimum position size (Binance minimum notional: $5)
-            min_notional = 5.0
-            min_quantity = min_notional / mark_price
-            
-            if quantity < min_quantity:
-                logger.warning(f"⚠️ Quantity below minimum notional: {quantity} -> {min_quantity}")
-                quantity = min_quantity
+            # 3. Minimum position size check removed to allow small trades
             
             # 4. Maximum single trade risk: 10% of balance
             max_risk_value = follower_balance * 0.10  # 10% max risk per trade
@@ -1143,35 +1137,8 @@ class CopyTradingEngine:
                 quantity = round(quantity, 1)
                 logger.info(f"📏 Applied safety precision rounding: -> {quantity}")
             
-            # Validate minimum notional value (Binance requires $5 minimum)
+            # Calculate notional value for logging purposes only
             notional_value = quantity * master_trade.price if master_trade.price else 0
-            min_notional = 5.0  # $5 minimum for Binance futures
-            
-            if notional_value < min_notional and master_trade.price > 0:
-                logger.warning(f"⚠️ Order value ${notional_value:.2f} is below minimum ${min_notional}")
-                logger.warning(f"📊 Quantity: {quantity}, Price: {master_trade.price}")
-                
-                # Try to adjust quantity to meet minimum notional requirement
-                if master_trade.price > 0:
-                    min_quantity = min_notional / master_trade.price
-                    # Round up to next valid quantity step
-                    try:
-                        adjusted_min_quantity = await follower_client.adjust_quantity_precision(master_trade.symbol, min_quantity)
-                        if adjusted_min_quantity > quantity:
-                            logger.info(f"🔧 Adjusting quantity to meet minimum notional: {quantity} -> {adjusted_min_quantity}")
-                            quantity = adjusted_min_quantity
-                            notional_value = quantity * master_trade.price
-                            logger.info(f"✅ New order value: ${notional_value:.2f}")
-                        else:
-                            logger.warning(f"⚠️ Cannot adjust quantity high enough to meet minimum notional")
-                            logger.warning(f"⚠️ Skipping this trade (too small)")
-                            return False
-                    except Exception as adjust_error:
-                        logger.warning(f"⚠️ Failed to adjust quantity for minimum notional: {adjust_error}")
-                        logger.warning(f"⚠️ Skipping this trade (too small)")
-                        return False
-                else:
-                    logger.warning(f"⚠️ Cannot validate notional value (price is 0), proceeding with caution")
             
             # Validate trade parameters before placing order
             logger.info(f"🎯 Placing follower order: {master_trade.symbol} {master_trade.side} {quantity} ({master_trade.order_type})")
@@ -1303,12 +1270,12 @@ class CopyTradingEngine:
                 logger.error(f"📊 Problem quantity was: {quantity}")
             elif "code=-4164" in error_msg:
                 notional_value = quantity * master_trade.price if master_trade.price else 0
-                logger.error("❌ NOTIONAL VALUE TOO SMALL!")
-                logger.error(f"📊 Order value: ${notional_value:.2f} (minimum required: $5)")
+                logger.error("❌ NOTIONAL VALUE ERROR!")
+                logger.error(f"📊 Order value: ${notional_value:.2f}")
                 logger.error(f"📊 Quantity: {quantity}, Price: {master_trade.price}")
-                logger.error(f"💡 Solution: Increase the quantity or skip small orders")
-                logger.warning(f"⚠️ Skipping this trade due to minimum notional requirement")
-                # Don't rollback the session for this error - it's expected for small orders
+                logger.error(f"💡 This may be a Binance-side restriction for very small orders")
+                logger.warning(f"⚠️ Order failed due to notional value issue")
+                # Don't rollback the session for this error - continue processing
                 return False
             else:
                 logger.error(f"❌ Unhandled error: {error_msg}")
