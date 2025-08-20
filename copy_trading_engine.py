@@ -905,6 +905,7 @@ class CopyTradingEngine:
             logger.info(f"   Follower risk%: {follower_account.risk_percentage}%")
             logger.info(f"   Follower leverage: {follower_account.leverage}x")
             logger.info(f"   Symbol price: ${mark_price:.4f}")
+            logger.info(f"🔍 DIAGNOSTIC - Input trade: {master_trade.quantity} {master_trade.symbol} @ ${master_trade.price}")
             
             # OPTION 1: Balance Ratio Position Sizing (Primary method - maintains proportional risk)
             if master_balance > 0 and follower_balance > 0:
@@ -1213,12 +1214,43 @@ class CopyTradingEngine:
             notional_value = quantity * master_trade.price if master_trade.price else 0
             binance_min_notional = 5.0  # Binance enforces this regardless of our settings
             
+            # Store original proportional quantity for potential scaling
+            original_proportional_quantity = quantity
+            
+            # DIAGNOSTIC LOGGING for troubleshooting
+            master_notional = master_trade.quantity * master_trade.price
+            logger.info(f"🔍 DIAGNOSTIC - Before minimum adjustment:")
+            logger.info(f"   Master trade: {master_trade.quantity} XRP × ${master_trade.price} = ${master_notional:.2f}")
+            logger.info(f"   Follower calculated: {quantity:.6f} XRP × ${master_trade.price} = ${notional_value:.2f}")
+            logger.info(f"   Meets minimum ${binance_min_notional}: {notional_value >= binance_min_notional}")
+            
             if notional_value < binance_min_notional and master_trade.price > 0:
                 logger.warning(f"⚠️ Order value ${notional_value:.2f} is below Binance's ${binance_min_notional} minimum")
                 logger.warning(f"📊 Current quantity: {quantity}, Price: {master_trade.price}")
                 
-                # Calculate minimum quantity needed to meet Binance requirement
-                min_quantity_needed = binance_min_notional / master_trade.price
+                # Calculate master trade's notional value to check if we should scale proportionally
+                master_notional = master_trade.quantity * master_trade.price
+                
+                # If master trade is also small and close to minimum, use minimum quantity
+                # If master trade is larger, scale proportionally above minimum
+                if master_notional > binance_min_notional * 2:  # Master trade is significantly larger than minimum
+                    # Scale proportionally above minimum instead of using fixed minimum
+                    min_quantity_needed = binance_min_notional / master_trade.price
+                    scale_factor = quantity / min_quantity_needed
+                    
+                    # If proportional quantity is very small, scale it up while maintaining some proportionality
+                    if scale_factor < 0.1:  # Less than 10% of minimum
+                        # Set to minimum but log that we're overriding proportionality
+                        min_quantity_needed = binance_min_notional / master_trade.price
+                        logger.warning(f"⚠️ Proportional quantity too small, using minimum: {quantity} -> minimum needed")
+                    else:
+                        # Scale above minimum to maintain some proportionality
+                        min_quantity_needed = binance_min_notional / master_trade.price * (1 + scale_factor)
+                        logger.info(f"📊 Scaling above minimum to maintain proportionality: scale factor {scale_factor:.3f}")
+                else:
+                    # Master trade is also small, use simple minimum
+                    min_quantity_needed = binance_min_notional / master_trade.price
+                    logger.info(f"📊 Master trade is small, using simple minimum quantity")
                 
                 # Try to adjust quantity to meet minimum notional requirement
                 try:
