@@ -296,7 +296,8 @@ def create_copy_config():
         "master_account_id": int(request.form['master_account_id']),
         "follower_account_id": int(request.form['follower_account_id']),
         "copy_percentage": float(request.form.get('copy_percentage', 100.0)),
-        "risk_multiplier": float(request.form.get('risk_multiplier', 1.0))
+        "risk_multiplier": float(request.form.get('risk_multiplier', 1.0)),
+        "max_risk_percentage": float(request.form.get('max_risk_percentage', 50.0))
     }
     
     result = post_api_data("/copy-trading-config", data)

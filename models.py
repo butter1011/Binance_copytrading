@@ -104,6 +104,7 @@ class CopyTradingConfig(Base):
     is_active = Column(Boolean, default=True)
     copy_percentage = Column(Float, default=100.0)  # Percentage of master trades to copy
     risk_multiplier = Column(Float, default=1.0)  # Risk multiplier for position sizing
+    max_risk_percentage = Column(Float, default=50.0)  # Maximum risk percentage per trade (default 50%)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

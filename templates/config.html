@@ -43,6 +43,13 @@
                         <div class="form-text">Multiplier for position sizing (1.0 = same risk as master)</div>
                     </div>
                     
+                    <div class="mb-3">
+                        <label for="max_risk_percentage" class="form-label">Max Risk Per Trade (%)</label>
+                        <input type="number" class="form-control" id="max_risk_percentage" name="max_risk_percentage" 
+                               value="50.0" min="1" max="100" step="1" required>
+                        <div class="form-text">Maximum risk percentage per trade (50% allows proper proportional scaling)</div>
+                    </div>
+                    
                     <button type="submit" class="btn btn-primary w-100">
                         <i class="fas fa-save me-2"></i>
                         Create Configuration
@@ -70,13 +77,14 @@
                                 <th>Follower Account</th>
                                 <th>Copy %</th>
                                 <th>Risk Multiplier</th>
+                                <th>Max Risk %</th>
                                 <th>Status</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="configs-table">
                             <tr>
-                                <td colspan="6" class="text-center">Loading...</td>
+                                <td colspan="7" class="text-center">Loading...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -114,6 +122,10 @@
                             <tr>
                                 <td>Risk Multiplier:</td>
                                 <td id="modal-risk-multiplier">-</td>
+                            </tr>
+                            <tr>
+                                <td>Max Risk %:</td>
+                                <td id="modal-max-risk-percentage">-</td>
                             </tr>
                         </table>
                     </div>
@@ -219,6 +231,7 @@
                 <td>${followerAccount ? followerAccount.name : 'Unknown'}</td>
                 <td>${config.copy_percentage}%</td>
                 <td>${config.risk_multiplier}</td>
+                <td>${config.max_risk_percentage || 50}%</td>
                 <td>
                     <span class="badge ${config.is_active ? 'bg-success' : 'bg-secondary'}">
                         ${config.is_active ? 'Active' : 'Inactive'}
@@ -261,6 +274,7 @@
         document.getElementById('modal-follower-account').textContent = followerAccount ? followerAccount.name : 'Unknown';
         document.getElementById('modal-copy-percentage').textContent = `${config.copy_percentage}%`;
         document.getElementById('modal-risk-multiplier').textContent = config.risk_multiplier;
+        document.getElementById('modal-max-risk-percentage').textContent = `${config.max_risk_percentage || 50}%`;
         document.getElementById('modal-created').textContent = new Date(config.created_at).toLocaleString();
         
         // Placeholder statistics

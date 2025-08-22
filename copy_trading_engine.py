@@ -1073,7 +1073,7 @@ class CopyTradingEngine:
                 logger.info(f"📊 After risk multiplier {config.risk_multiplier}: {quantity}")
             
             # Safety checks and limits
-            quantity = await self.apply_safety_limits(quantity, follower_balance, mark_price, follower_account, master_trade)
+            quantity = await self.apply_safety_limits(quantity, follower_balance, mark_price, follower_account, master_trade, config)
             
             # Fix floating point precision
             quantity = round(quantity, 8)
@@ -1179,42 +1179,55 @@ class CopyTradingEngine:
             logger.error(f"Error in balance-ratio calculation: {e}")
             return 0
     
-    async def apply_safety_limits(self, quantity: float, follower_balance: float, mark_price: float, follower_account, master_trade: Trade) -> float:
+    async def apply_safety_limits(self, quantity: float, follower_balance: float, mark_price: float, follower_account, master_trade: Trade, config: CopyTradingConfig) -> float:
         """Apply safety limits to prevent excessive risk"""
         try:
             original_quantity = quantity
             
-            # 1. Maximum position size: 20% of balance (conservative limit)
-            max_position_value = follower_balance * 0.20  # 20% max
-            max_quantity_by_balance = max_position_value / mark_price
-            
-            if quantity > max_quantity_by_balance:
-                logger.warning(f"⚠️ Quantity reduced by balance limit: {quantity} -> {max_quantity_by_balance}")
-                quantity = max_quantity_by_balance
-            
-            # 2. Maximum leverage check: prevent over-leveraging
+            # Calculate position value for risk assessment
             position_value = quantity * mark_price
-            effective_leverage = position_value / follower_balance
-            max_allowed_leverage = follower_account.leverage * 0.8  # Use 80% of max leverage
+            risk_percentage = (position_value / follower_balance) * 100 if follower_balance > 0 else 0
+            
+            # 1. Maximum leverage check: prevent over-leveraging (most critical safety check)
+            effective_leverage = position_value / follower_balance if follower_balance > 0 else 0
+            max_allowed_leverage = follower_account.leverage * 0.9  # Use 90% of max leverage for safety
             
             if effective_leverage > max_allowed_leverage:
                 safe_quantity = (follower_balance * max_allowed_leverage) / mark_price
-                logger.warning(f"⚠️ Quantity reduced by leverage limit: {quantity} -> {safe_quantity}")
+                logger.warning(f"⚠️ Quantity reduced by leverage limit: {quantity:.6f} -> {safe_quantity:.6f}")
                 logger.warning(f"   Effective leverage would be {effective_leverage:.1f}x, max allowed: {max_allowed_leverage:.1f}x")
                 quantity = safe_quantity
+                position_value = quantity * mark_price
+                risk_percentage = (position_value / follower_balance) * 100
             
-            # 3. Minimum position size check removed to allow small trades
-            
-            # 4. Maximum single trade risk: 10% of balance
-            max_risk_value = follower_balance * 0.10  # 10% max risk per trade
+            # 2. Maximum single trade risk: Configurable limit for proportional trading
+            # Use the configured max_risk_percentage from the copy trading config
+            # This allows for proper proportional scaling while maintaining configurable safety
+            max_risk_percentage = getattr(config, 'max_risk_percentage', 50.0)  # Default 50% if not set
+            max_risk_value = follower_balance * (max_risk_percentage / 100.0)
             max_quantity_by_risk = max_risk_value / mark_price
             
             if quantity > max_quantity_by_risk:
-                logger.warning(f"⚠️ Quantity reduced by risk limit: {quantity} -> {max_quantity_by_risk}")
+                logger.warning(f"⚠️ Quantity reduced by risk limit: {quantity:.6f} -> {max_quantity_by_risk:.6f}")
+                logger.warning(f"   Risk would be {risk_percentage:.1f}%, max allowed: {max_risk_percentage}%")
                 quantity = max_quantity_by_risk
+                position_value = quantity * mark_price
+                risk_percentage = (position_value / follower_balance) * 100
             
+            # 3. Maximum position size: More generous limit (removed the 20% hard cap)
+            # The leverage and risk limits above are more appropriate safety measures
+            
+            # 4. Log final risk assessment
             if quantity != original_quantity:
                 logger.info(f"📊 Safety limits applied: {original_quantity:.8f} -> {quantity:.8f}")
+                logger.info(f"   Final position value: ${position_value:.2f}")
+                logger.info(f"   Final risk percentage: {risk_percentage:.2f}%")
+                logger.info(f"   Effective leverage: {effective_leverage:.2f}x")
+            else:
+                logger.info(f"📊 No safety limits triggered")
+                logger.info(f"   Position value: ${position_value:.2f}")
+                logger.info(f"   Risk percentage: {risk_percentage:.2f}%")
+                logger.info(f"   Effective leverage: {effective_leverage:.2f}x")
             
             return quantity
             

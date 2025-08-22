@@ -51,11 +51,13 @@ class CopyTradingConfigCreate(BaseModel):
     follower_account_id: int
     copy_percentage: float = 100.0
     risk_multiplier: float = 1.0
+    max_risk_percentage: float = 50.0
 
 class CopyTradingConfigUpdate(BaseModel):
     is_active: Optional[bool] = None
     copy_percentage: Optional[float] = None
     risk_multiplier: Optional[float] = None
+    max_risk_percentage: Optional[float] = None
 
 class TradeCreate(BaseModel):
     account_id: int
@@ -263,7 +265,8 @@ async def create_copy_trading_config(config: CopyTradingConfigCreate, db = Depen
             master_account_id=config.master_account_id,
             follower_account_id=config.follower_account_id,
             copy_percentage=config.copy_percentage,
-            risk_multiplier=config.risk_multiplier
+            risk_multiplier=config.risk_multiplier,
+            max_risk_percentage=config.max_risk_percentage
         )
         
         db.add(db_config)
@@ -294,6 +297,7 @@ async def get_copy_trading_configs(db = Depends(get_db)):
                 "is_active": config.is_active,
                 "copy_percentage": config.copy_percentage,
                 "risk_multiplier": config.risk_multiplier,
+                "max_risk_percentage": config.max_risk_percentage,
                 "created_at": config.created_at
             }
             for config in configs
@@ -317,6 +321,8 @@ async def update_copy_trading_config(config_id: int, config_update: CopyTradingC
             db_config.copy_percentage = config_update.copy_percentage
         if config_update.risk_multiplier is not None:
             db_config.risk_multiplier = config_update.risk_multiplier
+        if config_update.max_risk_percentage is not None:
+            db_config.max_risk_percentage = config_update.max_risk_percentage
         
         db_config.updated_at = datetime.utcnow()
         db.commit()
@@ -731,7 +737,8 @@ async def simulate_position_sizing(
                 "follower_risk_setting": follower_account.risk_percentage,
                 "follower_leverage_setting": follower_account.leverage,
                 "copy_percentage": config.copy_percentage,
-                "risk_multiplier": config.risk_multiplier
+                "risk_multiplier": config.risk_multiplier,
+                "max_risk_percentage": config.max_risk_percentage
             },
             "symbol_info": {
                 "symbol": symbol,
